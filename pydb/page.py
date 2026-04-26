@@ -294,3 +294,32 @@ class SlottedPage:
           off, length = self._read_slot(i)
           if off != 0 or length != 0:
               yield i, bytes(self._buf[off:off + length])
+
+OVERFLOW_HEADER = 0  # next_page(u32) + payload_len(u16) + pad(2)
+
+def make_overflow_page(page_id: int, payload: bytes, next_page: int = INVALID_PAGE) -> SlottedPage:
+  """Create an overflow page storing raw *payload* bytes.
+
+  Args:
+      page_id (int): The page identifier.
+      payload (bytes): The payload.
+
+  Returns:
+      SlottedPage: The slotted page.
+  """
+  assert len(payload) <= PAGE_SIZE - HEADER_SIZE - OVERFLOW_HEADER
+  p = SlottedPage(page_id=page_id, page_type=PageType.OVERFLOW)
+  p.overflow_pid = next_page
+  # store payload right after header
+  start = HEADER_SIZE
+  struct.pack_into("<IH2x", p._buf, start, next_page, len(payload))
+  p._buf[start + OVERFLOW_HEADER:start + OVERFLOW_HEADER + len(payload)] = payload
+  p._write_header()
+  return p
+
+def read_overflow_payload(page: SlottedPage) -> tuple[bytes, int]:
+    """Return (payload, next_overflow_page_id) from an overflow page."""
+    start = HEADER_SIZE
+    next_pid, plen = struct.unpack_from("<IH", page._buf, start)
+    data = bytes(page._buf[start + OVERFLOW_HEADER:start + OVERFLOW_HEADER + plen])
+    return data, next_pid
