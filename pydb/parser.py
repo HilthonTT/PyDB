@@ -1,25 +1,25 @@
 """
 SQL Parser
 ==========
- 
+
 Overview
 --------
 This module transforms raw SQL text into a typed Abstract Syntax Tree
 (AST) in two stages:
- 
+
 1. **Tokenizer** (``tokenize``) — splits the input string into a flat
    list of ``Token`` objects using regex-based scanning.  Each token
    carries a type (``TT`` enum), a value (the parsed literal or
    keyword), and a source position for error messages.
- 
+
 2. **Recursive-descent parser** (``Parser``) — consumes the token
    stream and builds a tree of AST dataclass nodes.  The parser
-   implements operator-ecedence climbing for expressions, giving
+   implements operator-precedence climbing for expressions, giving
    correct handling of arithmetic, comparison, boolean, and
    grouping precedences.
- 
+
 The public entry point is ``parse_sql(sql) -> AST node``.
- 
+
 Supported SQL
 ~~~~~~~~~~~~~
 * ``CREATE TABLE name (col type [PRIMARY KEY] [NOT NULL], ...)``
@@ -36,11 +36,11 @@ Supported SQL
 * ``DELETE FROM table [WHERE cond]``
 * ``BEGIN`` / ``COMMIT`` / ``ROLLBACK``
 * ``EXPLAIN SELECT ...``
- 
+
 Expression precedence (low → high)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ::
- 
+
     OR
     AND
     NOT
@@ -49,18 +49,18 @@ Expression precedence (low → high)
     *  /
     unary -
     primary (literal, column ref, function call, parenthesised expr)
- 
+
 AST nodes
 ~~~~~~~~~
 Each SQL statement type has a corresponding dataclass:
 ``SelectStmt``, ``InsertStmt``, ``UpdateStmt``, ``DeleteStmt``,
 ``CreateTableStmt``, ``DropTableStmt``, ``CreateIndexStmt``,
 ``BeginStmt``, ``CommitStmt``, ``RollbackStmt``.
- 
+
 Expressions are represented as a tree of: ``ColumnRef``, ``Literal``,
 ``BinaryOp``, ``UnaryOp``, ``FuncCall``, ``IsNullExpr``, ``InExpr``,
 ``BetweenExpr``.
- 
+
 Error handling
 ~~~~~~~~~~~~~~
 Parse errors raise ``ParseError`` with the unexpected token's type,
@@ -69,17 +69,19 @@ SQL string the error occurred.
 """
 
 from __future__ import annotations
- 
+
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Optional, Union
 
+# ── Tokens ────────────────────────────────────────────────────────
+
 class TT(Enum):
     """Token type enumeration.
- 
+
     Covers three categories:
- 
+
     * **Literals** — ``IDENT`` (identifiers), ``NUMBER`` (int/float),
       ``STRING`` (single-quoted).
     * **Keywords** — SQL reserved words (``SELECT`` through ``OFFSET``).
@@ -119,13 +121,13 @@ class TT(Enum):
     PLUS   = auto(); MINUS  = auto(); SLASH   = auto()
     # meta
     EOF    = auto()
-    
+
 _KEYWORDS = {k.name: k for k in TT if k.value >= TT.SELECT.value and k.value <= TT.OFFSET.value}
- 
+
 @dataclass
 class Token:
     """A single lexical token produced by ``tokenize``.
- 
+
     Attributes
     ----------
     tt : TT
@@ -140,729 +142,687 @@ class Token:
     value: Any
     pos: int
 
+# ── Tokenizer ─────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# ParseError
-# ---------------------------------------------------------------------------
-
-class ParseError(Exception):
-    """Raised when the parser encounters unexpected input."""
-
-    def __init__(self, message: str, token: Optional[Token] = None):
-        self.token = token
-        pos_info = f" at position {token.pos}" if token else ""
-        super().__init__(f"{message}{pos_info}")
-
-
-# ---------------------------------------------------------------------------
-# Tokenizer
-# ---------------------------------------------------------------------------
-
-_TOKEN_RE = re.compile(
-    r"""
-    (?P<WS>      \s+                    )
-  | (?P<STRING>  '(?:''|[^'])*'         )
-  | (?P<NUMBER>  \d+(?:\.\d+)?          )
-  | (?P<IDENT>   [A-Za-z_]\w*           )
-  | (?P<NE>      <>                     )
-  | (?P<LE>      <=                     )
-  | (?P<GE>      >=                     )
-  | (?P<LPAREN>  \(                     )
-  | (?P<RPAREN>  \)                     )
-  | (?P<COMMA>   ,                      )
-  | (?P<DOT>     \.                     )
-  | (?P<SEMI>    ;                      )
-  | (?P<STAR>    \*                     )
-  | (?P<EQ>      =                      )
-  | (?P<LT>      <                      )
-  | (?P<GT>      >                      )
-  | (?P<PLUS>    \+                     )
-  | (?P<MINUS>   -                      )
-  | (?P<SLASH>   /                      )
-    """,
-    re.VERBOSE,
-)
-
+_PATTERNS = [
+    (r"--[^\n]*",              None),          # line comment
+    (r"\s+",                   None),          # whitespace
+    (r"'(?:''|[^'])*'",       "STRING"),
+    (r"\d+\.\d+",             "FLOAT_LIT"),
+    (r"\d+",                  "INT_LIT"),
+    (r"<=",                   "LE"),
+    (r">=",                   "GE"),
+    (r"<>|!=",                "NE"),
+    (r"=",                    "EQ"),
+    (r"<",                    "LT"),
+    (r">",                    "GT"),
+    (r"\+",                   "PLUS"),
+    (r"-",                    "MINUS"),
+    (r"/",                    "SLASH"),
+    (r"\*",                   "STAR"),
+    (r"\(",                   "LPAREN"),
+    (r"\)",                   "RPAREN"),
+    (r",",                    "COMMA"),
+    (r"\.",                   "DOT"),
+    (r";",                    "SEMI"),
+    (r"[A-Za-z_][A-Za-z0-9_]*", "IDENT"),
+]
+_RE = re.compile("|".join(f"(?P<G{i}>{p})" for i, (p, _) in enumerate(_PATTERNS)))
 
 def tokenize(sql: str) -> list[Token]:
-    """Split a SQL string into a list of ``Token`` objects.
+    """Scan a SQL string into a list of tokens.
 
+    Uses a single compiled regex with named groups, one per pattern.
+    Whitespace and line comments (``-- ...``) are discarded.
     Identifiers are checked against ``_KEYWORDS`` and promoted to
-    their keyword token type when matched.  A sentinel ``EOF`` token
-    is appended at the end.
+    their keyword token type if matched (case-insensitive).
+
+    The returned list always ends with a ``TT.EOF`` sentinel so
+    that the parser can safely peek without bounds checking.
+
+    Parameters
+    ----------
+    sql : str
+        The raw SQL input string.
+
+    Returns
+    -------
+    list[Token]
+        Tokens in source order, terminated by ``EOF``.
     """
     tokens: list[Token] = []
-    expected = 0
-
-    for m in _TOKEN_RE.finditer(sql):
-        if m.start() != expected:
-            raise ParseError(f"Unexpected character {sql[expected]!r}",
-                             Token(TT.EOF, None, expected))
-        expected = m.end()
-        kind = m.lastgroup
-        text = m.group()
+    for m in _RE.finditer(sql):
+        idx = None
+        for i in range(len(_PATTERNS)):
+            if m.group(f"G{i}") is not None:
+                idx = i
+                break
+        if idx is None:
+            continue
+        _, tag = _PATTERNS[idx]
+        if tag is None:
+            continue
+        val = m.group()
         pos = m.start()
 
-        if kind == "WS":
-            continue
-        elif kind == "STRING":
-            tokens.append(Token(TT.STRING, text[1:-1].replace("''", "'"), pos))
-        elif kind == "NUMBER":
-            val: Union[int, float] = float(text) if "." in text else int(text)
-            tokens.append(Token(TT.NUMBER, val, pos))
-        elif kind == "IDENT":
-            upper = text.upper()
-            tt = _KEYWORDS.get(upper, TT.IDENT)
-            tokens.append(Token(tt, text, pos))
+        if tag == "STRING":
+            tokens.append(Token(TT.STRING, val[1:-1].replace("''", "'"), pos))
+        elif tag == "FLOAT_LIT":
+            tokens.append(Token(TT.NUMBER, float(val), pos))
+        elif tag == "INT_LIT":
+            tokens.append(Token(TT.NUMBER, int(val), pos))
+        elif tag == "IDENT":
+            kw = _KEYWORDS.get(val.upper())
+            if kw:
+                tokens.append(Token(kw, val, pos))
+            else:
+                tokens.append(Token(TT.IDENT, val, pos))
         else:
-            tokens.append(Token(TT[kind], text, pos))
-
-    if expected != len(sql):
-        raise ParseError(f"Unexpected character {sql[expected]!r}",
-                         Token(TT.EOF, None, expected))
+            tokens.append(Token(TT[tag], val, pos))
 
     tokens.append(Token(TT.EOF, None, len(sql)))
     return tokens
 
-
-# ---------------------------------------------------------------------------
-# AST — Expression Nodes
-# ---------------------------------------------------------------------------
+# ── AST nodes ─────────────────────────────────────────────────────
 
 @dataclass
 class ColumnRef:
-    """Column reference, optionally table-qualified.  ``name="*"`` for wildcards."""
+    """Reference to a table column: ``[table.]name``."""
     table: Optional[str]
     name: str
 
 @dataclass
 class Literal:
-    """Literal value: int, float, str, bool, or None (SQL NULL)."""
+    """A constant value: integer, float, string, bool, None, or ``'*'``."""
     value: Any
 
 @dataclass
 class BinaryOp:
-    """Binary operation (arithmetic, comparison, or boolean)."""
+    """Binary operator expression: ``left op right``.
+
+    *op* is one of ``'+', '-', '*', '/', '=', '<>', '<', '>', '<=',
+    '>=', 'AND', 'OR', 'LIKE'``.
+    """
     op: str
     left: Any
     right: Any
 
 @dataclass
 class UnaryOp:
-    """Unary NOT or unary minus."""
+    """Unary operator expression: ``op operand`` (``NOT`` or ``-``)."""
     op: str
     operand: Any
 
 @dataclass
 class FuncCall:
-    """Function call, including aggregates (COUNT, SUM, etc.)."""
+    """Aggregate or scalar function call: ``name([DISTINCT] args)``."""
     name: str
     args: list
     distinct: bool = False
 
 @dataclass
 class IsNullExpr:
-    """IS NULL / IS NOT NULL test."""
+    """``expr IS [NOT] NULL`` expression."""
     expr: Any
-    negated: bool
+    negated: bool = False
 
 @dataclass
 class InExpr:
-    """IN (value_list) / NOT IN (value_list)."""
+    """``expr [NOT] IN (values)`` expression."""
     expr: Any
     values: list
     negated: bool = False
 
 @dataclass
 class BetweenExpr:
-    """BETWEEN low AND high / NOT BETWEEN low AND high."""
+    """``expr BETWEEN low AND high`` expression."""
     expr: Any
     low: Any
     high: Any
-    negated: bool = False
-
-
-# ---------------------------------------------------------------------------
-# AST — Helper Nodes
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SelectColumn:
-    """One item in a SELECT column list."""
-    expr: Any
-    alias: Optional[str]
-
-@dataclass
-class OrderByItem:
-    """One ORDER BY element."""
-    expr: Any
-    descending: bool
-
-@dataclass
-class JoinClause:
-    """A single JOIN clause."""
-    join_type: str          # INNER, LEFT, RIGHT, CROSS
-    table: str
-    alias: Optional[str]
-    condition: Any          # ON expression; None for CROSS JOIN
-
-@dataclass
-class ColumnDef:
-    """Column definition in CREATE TABLE (parser-level, not catalog-level)."""
-    name: str
-    type_name: str          # raw SQL type string, e.g. "VARCHAR(255)"
-    primary_key: bool = False
-    nullable: bool = True
-
-
-# ---------------------------------------------------------------------------
-# AST — Statement Nodes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class SelectStmt:
-    columns: list           # list[SelectColumn]
-    from_table: Optional[str]
-    from_alias: Optional[str]
-    joins: list             # list[JoinClause]
-    where: Any
-    group_by: list
-    having: Any
-    order_by: list          # list[OrderByItem]
-    limit: Any
-    offset: Any
-    distinct: bool = False
+    """Parsed ``SELECT`` statement.
+
+    Attributes
+    ----------
+    columns : list
+        Selected expressions (``ColumnRef``, ``Literal('*')``, ``FuncCall``).
+    from_table : TableRef or None
+        The primary table (``None`` for expression-only SELECTs).
+    joins : list[JoinClause]
+        Zero or more JOIN clauses.
+    where : AST node or None
+        The WHERE predicate expression.
+    order_by : list[tuple]
+        ``[(expr, 'ASC'|'DESC'), ...]``.
+    limit, offset : int or None
+        Row count limits.
+    group_by : list
+        GROUP BY expressions.
+    having : AST node or None
+        The HAVING predicate (post-aggregation filter).
+    explain : bool
+        ``True`` if ``EXPLAIN`` was used.
+    """
+    columns: list              # [ColumnRef | Literal('*') | FuncCall]
+    from_table: Optional["TableRef"] = None
+    joins: list["JoinClause"] = field(default_factory=list)
+    where: Any = None
+    order_by: list[tuple] = field(default_factory=list)  # [(expr, 'ASC'|'DESC')]
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+    group_by: list = field(default_factory=list)
+    having: Any = None
+    explain: bool = False
+
+@dataclass
+class TableRef:
+    """Table reference with optional alias: ``table [AS alias]``."""
+    name: str
+    alias: Optional[str] = None
+
+@dataclass
+class JoinClause:
+    """A single JOIN clause within a SELECT statement."""
+    join_type: str        # 'INNER','LEFT','RIGHT','CROSS'
+    table: TableRef
+    on: Any = None
 
 @dataclass
 class InsertStmt:
+    """Parsed ``INSERT INTO table (cols) VALUES (...), ...`` statement."""
     table: str
-    columns: list           # list[str]
-    values: list            # list[list] — each inner list is one row of exprs
+    columns: list[str]
+    rows: list[list]
 
 @dataclass
 class UpdateStmt:
+    """Parsed ``UPDATE table SET col=val, ... [WHERE cond]`` statement."""
     table: str
-    assignments: list       # list[tuple[str, expr]]
-    where: Any
+    assignments: list[tuple[str, Any]]
+    where: Any = None
 
 @dataclass
 class DeleteStmt:
+    """Parsed ``DELETE FROM table [WHERE cond]`` statement."""
     table: str
-    where: Any
+    where: Any = None
 
 @dataclass
 class CreateTableStmt:
-    name: str
-    columns: list           # list[ColumnDef]
+    """Parsed ``CREATE TABLE`` statement.
+
+    ``columns`` is a list of ``(name, type_str, nullable, is_pk)`` tuples.
+    """
+    table: str
+    columns: list[tuple[str, str, bool, bool]]
 
 @dataclass
 class DropTableStmt:
-    name: str
+    """Parsed ``DROP TABLE name`` statement."""
+    table: str
 
 @dataclass
 class CreateIndexStmt:
-    name: str
+    """Parsed ``CREATE [UNIQUE] INDEX name ON table (cols)`` statement."""
+    index_name: str
     table: str
-    columns: list           # list[str]
-    unique: bool
+    columns: list[str]
+    unique: bool = False
 
 @dataclass
 class BeginStmt:
+    """Parsed ``BEGIN`` statement."""
     pass
-
 @dataclass
 class CommitStmt:
+    """Parsed ``COMMIT`` statement."""
     pass
-
 @dataclass
 class RollbackStmt:
+    """Parsed ``ROLLBACK`` statement."""
     pass
 
-@dataclass
-class ExplainStmt:
-    stmt: Any
-
-
-# ---------------------------------------------------------------------------
-# Keywords that start SQL clauses (used to stop implicit alias detection)
-# ---------------------------------------------------------------------------
-
-_CLAUSE_KW = frozenset({
-    TT.FROM, TT.WHERE, TT.GROUP, TT.ORDER, TT.LIMIT, TT.OFFSET,
-    TT.JOIN, TT.INNER, TT.LEFT, TT.RIGHT, TT.CROSS,
-    TT.ON, TT.HAVING, TT.SET, TT.VALUES, TT.INTO,
-})
-
-# Aggregate function token types
-_AGG_FUNCS = frozenset({TT.COUNT, TT.SUM, TT.AVG, TT.MIN, TT.MAX})
-
-
-# ---------------------------------------------------------------------------
-# Recursive-Descent Parser
-# ---------------------------------------------------------------------------
+class ParseError(Exception):
+    pass
 
 class Parser:
-    """Recursive-descent parser with Pratt-style precedence climbing."""
+    """Recursive-descent SQL parser.
 
+    Consumes a token list and builds an AST.  Each grammar rule is
+    a method named after the production it handles (e.g. ``_select``,
+    ``_expr``, ``_comparison``).  Expression parsing uses
+    precedence climbing: ``_expr`` → ``_or_expr`` → ``_and_expr`` →
+    ``_not_expr`` → ``_comparison`` → ``_addition`` → ``_multiplication``
+    → ``_unary`` → ``_primary``.
+
+    Parameters
+    ----------
+    tokens : list[Token]
+        The token stream from ``tokenize()``, terminated by ``EOF``.
+    """
     def __init__(self, tokens: list[Token]):
-        self.tokens = tokens
-        self.pos = 0
-
-    # -- infrastructure ----------------------------------------------------
+        self._tokens = tokens
+        self._pos = 0
 
     def _peek(self) -> Token:
-        return self.tokens[self.pos]
+        return self._tokens[self._pos]
 
     def _advance(self) -> Token:
-        tok = self.tokens[self.pos]
-        self.pos += 1
-        return tok
+        t = self._tokens[self._pos]
+        self._pos += 1
+        return t
 
     def _expect(self, tt: TT) -> Token:
-        tok = self._peek()
-        if tok.tt != tt:
-            raise ParseError(f"Expected {tt.name}, got {tok.tt.name} ({tok.value!r})", tok)
-        return self._advance()
+        t = self._advance()
+        if t.tt != tt:
+            raise ParseError(f"Expected {tt.name} but got {t.tt.name} ('{t.value}') at pos {t.pos}")
+        return t
 
     def _match(self, *tts: TT) -> Optional[Token]:
         if self._peek().tt in tts:
             return self._advance()
         return None
 
-    def _at(self, *tts: TT) -> bool:
-        return self._peek().tt in tts
-
-    # -- top-level dispatch ------------------------------------------------
-
+    # ── entry point ───────────────────────────────────────────────
     def parse(self):
-        tok = self._peek()
-        if tok.tt == TT.SELECT:
-            stmt = self._parse_select()
-        elif tok.tt == TT.INSERT:
-            stmt = self._parse_insert()
-        elif tok.tt == TT.UPDATE:
-            stmt = self._parse_update()
-        elif tok.tt == TT.DELETE:
-            stmt = self._parse_delete()
-        elif tok.tt == TT.CREATE:
-            stmt = self._parse_create()
-        elif tok.tt == TT.DROP:
-            stmt = self._parse_drop()
-        elif tok.tt == TT.BEGIN:
-            self._advance()
-            stmt = BeginStmt()
-        elif tok.tt == TT.COMMIT:
-            self._advance()
-            stmt = CommitStmt()
-        elif tok.tt == TT.ROLLBACK:
-            self._advance()
-            stmt = RollbackStmt()
-        elif tok.tt == TT.EXPLAIN:
-            stmt = self._parse_explain()
-        else:
-            raise ParseError(f"Unexpected token {tok.tt.name}", tok)
-
+        stmt = self._statement()
         self._match(TT.SEMI)
-        if not self._at(TT.EOF):
-            t = self._peek()
-            raise ParseError(f"Expected end of input, got {t.tt.name}", t)
         return stmt
 
-    # -- statement parsers -------------------------------------------------
-
-    def _parse_select(self) -> SelectStmt:
-        self._expect(TT.SELECT)
-        distinct = self._match(TT.DISTINCT) is not None
-        columns = self._parse_select_columns()
-        self._expect(TT.FROM)
-        from_table = self._parse_table_name()
-        from_alias = self._parse_optional_alias()
-        joins = self._parse_joins()
-        where = self._parse_expression() if self._match(TT.WHERE) else None
-        group_by: list = []
-        having = None
-        if self._match(TT.GROUP):
-            self._expect(TT.BY)
-            group_by = self._parse_expression_list()
-            if self._match(TT.HAVING):
-                having = self._parse_expression()
-        order_by = self._parse_order_by() if self._at(TT.ORDER) else []
-        limit = self._parse_expression() if self._match(TT.LIMIT) else None
-        offset = self._parse_expression() if self._match(TT.OFFSET) else None
-        return SelectStmt(columns, from_table, from_alias, joins, where,
-                          group_by, having, order_by, limit, offset, distinct)
-
-    def _parse_table_name(self) -> str:
-        tok = self._peek()
-        if tok.tt == TT.IDENT:
-            return self._advance().value
-        # Allow keywords used as table names in some contexts
-        raise ParseError(f"Expected table name, got {tok.tt.name}", tok)
-
-    def _parse_optional_alias(self) -> Optional[str]:
-        if self._match(TT.AS):
-            return self._expect(TT.IDENT).value
-        if self._at(TT.IDENT) and self._peek().tt not in _CLAUSE_KW:
-            return self._advance().value
-        return None
-
-    def _parse_select_columns(self) -> list:
-        # Bare * for SELECT *
-        if self._at(TT.STAR):
+    def _statement(self):
+        t = self._peek()
+        if t.tt == TT.SELECT:
+            return self._select()
+        if t.tt == TT.EXPLAIN:
             self._advance()
-            return [SelectColumn(ColumnRef(None, "*"), None)]
+            s = self._select()
+            s.explain = True
+            return s
+        if t.tt == TT.INSERT:
+            return self._insert()
+        if t.tt == TT.UPDATE:
+            return self._update()
+        if t.tt == TT.DELETE:
+            return self._delete()
+        if t.tt == TT.CREATE:
+            return self._create()
+        if t.tt == TT.DROP:
+            return self._drop()
+        if t.tt == TT.BEGIN:
+            self._advance(); return BeginStmt()
+        if t.tt == TT.COMMIT:
+            self._advance(); return CommitStmt()
+        if t.tt == TT.ROLLBACK:
+            self._advance(); return RollbackStmt()
+        raise ParseError(f"Unexpected token {t.tt.name} at pos {t.pos}")
 
-        cols: list[SelectColumn] = []
-        while True:
-            expr = self._parse_expression()
-            alias: Optional[str] = None
-            if self._match(TT.AS):
-                alias = self._expect(TT.IDENT).value
-            elif self._at(TT.IDENT) and self._peek().tt not in _CLAUSE_KW:
-                alias = self._advance().value
-            cols.append(SelectColumn(expr, alias))
-            if not self._match(TT.COMMA):
-                break
+    # ── SELECT ────────────────────────────────────────────────────
+    def _select(self):
+        self._expect(TT.SELECT)
+        cols = self._select_columns()
+        from_table = None
+        joins = []
+        where = None
+        group_by = []
+        having = None
+        order_by = []
+        limit = None
+        offset = None
+
+        if self._match(TT.FROM):
+            from_table = self._table_ref()
+            while self._peek().tt in (TT.JOIN, TT.INNER, TT.LEFT, TT.RIGHT, TT.CROSS):
+                joins.append(self._join_clause())
+            if self._match(TT.WHERE):
+                where = self._expr()
+            if self._match(TT.GROUP):
+                self._expect(TT.BY)
+                group_by = [self._expr()]
+                while self._match(TT.COMMA):
+                    group_by.append(self._expr())
+                if self._match(TT.HAVING):
+                    having = self._expr()
+            if self._match(TT.ORDER):
+                self._expect(TT.BY)
+                order_by = self._order_list()
+            if self._match(TT.LIMIT):
+                limit = int(self._expect(TT.NUMBER).value)
+                if self._match(TT.OFFSET):
+                    offset = int(self._expect(TT.NUMBER).value)
+
+        return SelectStmt(cols, from_table, joins, where, order_by,
+                          limit, offset, group_by, having)
+
+    def _select_columns(self):
+        if self._match(TT.STAR):
+            return [Literal("*")]
+        cols = [self._select_col()]
+        while self._match(TT.COMMA):
+            cols.append(self._select_col())
         return cols
 
-    def _parse_joins(self) -> list:
-        joins: list[JoinClause] = []
-        while self._at(TT.JOIN, TT.INNER, TT.LEFT, TT.RIGHT, TT.CROSS):
-            join_type = "INNER"
-            tok = self._peek()
-            if tok.tt in (TT.INNER, TT.LEFT, TT.RIGHT, TT.CROSS):
-                join_type = tok.tt.name
-                self._advance()
-            self._expect(TT.JOIN)
-            table = self._parse_table_name()
-            alias = self._parse_optional_alias()
-            condition = None
-            if join_type != "CROSS":
-                self._expect(TT.ON)
-                condition = self._parse_expression()
-            joins.append(JoinClause(join_type, table, alias, condition))
-        return joins
+    def _select_col(self):
+        return self._expr()
 
-    def _parse_order_by(self) -> list:
-        self._expect(TT.ORDER)
-        self._expect(TT.BY)
-        items: list[OrderByItem] = []
-        while True:
-            expr = self._parse_expression()
-            desc = False
-            if self._match(TT.DESC):
-                desc = True
-            else:
-                self._match(TT.ASC)
-            items.append(OrderByItem(expr, desc))
-            if not self._match(TT.COMMA):
-                break
+    def _table_ref(self) -> TableRef:
+        name = self._expect(TT.IDENT).value
+        alias = None
+        if self._match(TT.AS):
+            alias = self._expect(TT.IDENT).value
+        elif self._peek().tt == TT.IDENT and self._peek().tt not in (
+                TT.WHERE, TT.ORDER, TT.JOIN, TT.INNER, TT.LEFT,
+                TT.RIGHT, TT.CROSS, TT.GROUP, TT.LIMIT, TT.ON):
+            alias = self._advance().value
+        return TableRef(name, alias)
+
+    def _join_clause(self) -> JoinClause:
+        jt = "INNER"
+        if self._match(TT.LEFT):
+            jt = "LEFT"
+        elif self._match(TT.RIGHT):
+            jt = "RIGHT"
+        elif self._match(TT.CROSS):
+            jt = "CROSS"
+        elif self._match(TT.INNER):
+            pass
+        self._expect(TT.JOIN)
+        tbl = self._table_ref()
+        on = None
+        if self._match(TT.ON):
+            on = self._expr()
+        return JoinClause(jt, tbl, on)
+
+    def _order_list(self):
+        items = [self._order_item()]
+        while self._match(TT.COMMA):
+            items.append(self._order_item())
         return items
 
-    def _parse_insert(self) -> InsertStmt:
+    def _order_item(self):
+        e = self._expr()
+        direction = "ASC"
+        if self._match(TT.DESC):
+            direction = "DESC"
+        elif self._match(TT.ASC):
+            pass
+        return (e, direction)
+
+    # ── expressions (precedence climbing) ─────────────────────────
+    def _expr(self):
+        return self._or_expr()
+
+    def _or_expr(self):
+        left = self._and_expr()
+        while self._match(TT.OR):
+            left = BinaryOp("OR", left, self._and_expr())
+        return left
+
+    def _and_expr(self):
+        left = self._not_expr()
+        while self._match(TT.AND):
+            left = BinaryOp("AND", left, self._not_expr())
+        return left
+
+    def _not_expr(self):
+        if self._match(TT.NOT):
+            return UnaryOp("NOT", self._not_expr())
+        return self._comparison()
+
+    def _comparison(self):
+        left = self._addition()
+        if self._match(TT.EQ):
+            return BinaryOp("=", left, self._addition())
+        if self._match(TT.NE):
+            return BinaryOp("<>", left, self._addition())
+        if self._match(TT.LT):
+            return BinaryOp("<", left, self._addition())
+        if self._match(TT.GT):
+            return BinaryOp(">", left, self._addition())
+        if self._match(TT.LE):
+            return BinaryOp("<=", left, self._addition())
+        if self._match(TT.GE):
+            return BinaryOp(">=", left, self._addition())
+        if self._match(TT.LIKE):
+            return BinaryOp("LIKE", left, self._addition())
+        if self._peek().tt == TT.IS:
+            self._advance()
+            neg = bool(self._match(TT.NOT))
+            self._expect(TT.NULL)
+            return IsNullExpr(left, negated=neg)
+        if self._peek().tt == TT.NOT:
+            # lookahead for NOT IN / NOT BETWEEN
+            saved = self._pos
+            self._advance()
+            if self._match(TT.IN):
+                return self._in_list(left, negated=True)
+            if self._match(TT.BETWEEN):
+                return self._between(left, negated=True)
+            self._pos = saved
+        if self._match(TT.IN):
+            return self._in_list(left)
+        if self._match(TT.BETWEEN):
+            return self._between(left)
+        return left
+
+    def _in_list(self, left, negated=False):
+        self._expect(TT.LPAREN)
+        vals = [self._expr()]
+        while self._match(TT.COMMA):
+            vals.append(self._expr())
+        self._expect(TT.RPAREN)
+        return InExpr(left, vals, negated)
+
+    def _between(self, left, negated=False):
+        lo = self._addition()
+        self._expect(TT.AND)
+        hi = self._addition()
+        return BetweenExpr(left, lo, hi)
+
+    def _addition(self):
+        left = self._multiplication()
+        while True:
+            if self._match(TT.PLUS):
+                left = BinaryOp("+", left, self._multiplication())
+            elif self._match(TT.MINUS):
+                left = BinaryOp("-", left, self._multiplication())
+            else:
+                break
+        return left
+
+    def _multiplication(self):
+        left = self._unary()
+        while True:
+            if self._match(TT.STAR):
+                left = BinaryOp("*", left, self._unary())
+            elif self._match(TT.SLASH):
+                left = BinaryOp("/", left, self._unary())
+            else:
+                break
+        return left
+
+    def _unary(self):
+        if self._match(TT.MINUS):
+            return UnaryOp("-", self._primary())
+        return self._primary()
+
+    def _primary(self):
+        t = self._peek()
+        # aggregate functions
+        if t.tt in (TT.COUNT, TT.SUM, TT.AVG, TT.MIN, TT.MAX):
+            return self._agg_func()
+        if t.tt == TT.NUMBER:
+            self._advance()
+            return Literal(t.value)
+        if t.tt == TT.STRING:
+            self._advance()
+            return Literal(t.value)
+        if t.tt == TT.TRUE:
+            self._advance()
+            return Literal(True)
+        if t.tt == TT.FALSE:
+            self._advance()
+            return Literal(False)
+        if t.tt == TT.NULL:
+            self._advance()
+            return Literal(None)
+        if t.tt == TT.LPAREN:
+            self._advance()
+            e = self._expr()
+            self._expect(TT.RPAREN)
+            return e
+        if t.tt == TT.IDENT:
+            self._advance()
+            if self._match(TT.DOT):
+                col = self._expect(TT.IDENT).value
+                return ColumnRef(t.value, col)
+            return ColumnRef(None, t.value)
+        if t.tt == TT.STAR:
+            self._advance()
+            return Literal("*")
+        raise ParseError(f"Unexpected {t.tt.name} at pos {t.pos}")
+
+    def _agg_func(self):
+        t = self._advance()
+        self._expect(TT.LPAREN)
+        distinct = bool(self._match(TT.DISTINCT))
+        if self._match(TT.STAR):
+            args = [Literal("*")]
+        else:
+            args = [self._expr()]
+        self._expect(TT.RPAREN)
+        return FuncCall(t.tt.name, args, distinct)
+
+    # ── INSERT ────────────────────────────────────────────────────
+    def _insert(self):
         self._expect(TT.INSERT)
         self._expect(TT.INTO)
-        table = self._parse_table_name()
-        self._expect(TT.LPAREN)
-        columns = self._parse_ident_list()
-        self._expect(TT.RPAREN)
-        self._expect(TT.VALUES)
-        rows: list[list] = []
-        while True:
-            self._expect(TT.LPAREN)
-            row = self._parse_expression_list()
+        table = self._expect(TT.IDENT).value
+        cols = []
+        if self._match(TT.LPAREN):
+            cols.append(self._expect(TT.IDENT).value)
+            while self._match(TT.COMMA):
+                cols.append(self._expect(TT.IDENT).value)
             self._expect(TT.RPAREN)
-            rows.append(row)
-            if not self._match(TT.COMMA):
-                break
-        return InsertStmt(table, columns, rows)
+        self._expect(TT.VALUES)
+        rows = [self._value_list()]
+        while self._match(TT.COMMA):
+            rows.append(self._value_list())
+        return InsertStmt(table, cols, rows)
 
-    def _parse_update(self) -> UpdateStmt:
+    def _value_list(self):
+        self._expect(TT.LPAREN)
+        vals = [self._expr()]
+        while self._match(TT.COMMA):
+            vals.append(self._expr())
+        self._expect(TT.RPAREN)
+        return vals
+
+    # ── UPDATE ────────────────────────────────────────────────────
+    def _update(self):
         self._expect(TT.UPDATE)
-        table = self._parse_table_name()
+        table = self._expect(TT.IDENT).value
         self._expect(TT.SET)
-        assignments: list[tuple] = []
-        while True:
-            col = self._expect(TT.IDENT).value
-            self._expect(TT.EQ)
-            val = self._parse_expression()
-            assignments.append((col, val))
-            if not self._match(TT.COMMA):
-                break
-        where = self._parse_expression() if self._match(TT.WHERE) else None
+        assignments = [self._assignment()]
+        while self._match(TT.COMMA):
+            assignments.append(self._assignment())
+        where = None
+        if self._match(TT.WHERE):
+            where = self._expr()
         return UpdateStmt(table, assignments, where)
 
-    def _parse_delete(self) -> DeleteStmt:
+    def _assignment(self):
+        col = self._expect(TT.IDENT).value
+        self._expect(TT.EQ)
+        val = self._expr()
+        return (col, val)
+
+    # ── DELETE ────────────────────────────────────────────────────
+    def _delete(self):
         self._expect(TT.DELETE)
         self._expect(TT.FROM)
-        table = self._parse_table_name()
-        where = self._parse_expression() if self._match(TT.WHERE) else None
+        table = self._expect(TT.IDENT).value
+        where = None
+        if self._match(TT.WHERE):
+            where = self._expr()
         return DeleteStmt(table, where)
 
-    def _parse_create(self):
+    # ── CREATE ────────────────────────────────────────────────────
+    def _create(self):
         self._expect(TT.CREATE)
-        unique = self._match(TT.UNIQUE) is not None
-        if self._at(TT.TABLE):
-            if unique:
-                raise ParseError("UNIQUE not valid for CREATE TABLE", self._peek())
-            return self._parse_create_table()
-        if self._at(TT.INDEX):
-            return self._parse_create_index(unique)
-        raise ParseError(f"Expected TABLE or INDEX after CREATE", self._peek())
+        if self._match(TT.TABLE):
+            return self._create_table()
+        unique = bool(self._match(TT.UNIQUE))
+        self._expect(TT.INDEX)
+        return self._create_index(unique)
 
-    def _parse_create_table(self) -> CreateTableStmt:
-        self._expect(TT.TABLE)
-        name = self._parse_table_name()
+    def _create_table(self):
+        name = self._expect(TT.IDENT).value
         self._expect(TT.LPAREN)
-        cols: list[ColumnDef] = []
-        while True:
-            cols.append(self._parse_column_def())
-            if not self._match(TT.COMMA):
-                break
+        cols = [self._col_def()]
+        while self._match(TT.COMMA):
+            cols.append(self._col_def())
         self._expect(TT.RPAREN)
         return CreateTableStmt(name, cols)
 
-    def _parse_column_def(self) -> ColumnDef:
-        name = self._expect(TT.IDENT).value
-        # Type name — may be a keyword like INT, or an ident like VARCHAR
-        type_tok = self._peek()
-        if type_tok.tt == TT.IDENT or type_tok.tt in _KEYWORDS.values():
-            type_name = self._advance().value
-        else:
-            raise ParseError(f"Expected column type, got {type_tok.tt.name}", type_tok)
-        # Handle parenthesized suffix like VARCHAR(255)
-        if self._match(TT.LPAREN):
-            inner = self._expect(TT.NUMBER).value
-            self._expect(TT.RPAREN)
-            type_name = f"{type_name}({inner})"
-        pk = False
+    def _col_def(self):
+        cname = self._expect(TT.IDENT).value
+        ctype = self._expect(TT.IDENT).value
         nullable = True
-        # Parse constraints (any order, any number)
-        while True:
-            if self._at(TT.PRIMARY):
-                self._advance()
+        pk = False
+        while self._peek().tt in (TT.PRIMARY, TT.NOT, TT.NULL):
+            if self._match(TT.PRIMARY):
                 self._expect(TT.KEY)
                 pk = True
                 nullable = False
-            elif self._at(TT.NOT):
-                self._advance()
+            elif self._match(TT.NOT):
                 self._expect(TT.NULL)
                 nullable = False
-            else:
-                break
-        return ColumnDef(name, type_name, pk, nullable)
+        return (cname, ctype, nullable, pk)
 
-    def _parse_create_index(self, unique: bool) -> CreateIndexStmt:
-        self._expect(TT.INDEX)
-        name = self._expect(TT.IDENT).value
+    def _create_index(self, unique: bool):
+        idx_name = self._expect(TT.IDENT).value
         self._expect(TT.ON)
-        table = self._parse_table_name()
+        table = self._expect(TT.IDENT).value
         self._expect(TT.LPAREN)
-        columns = self._parse_ident_list()
+        cols = [self._expect(TT.IDENT).value]
+        while self._match(TT.COMMA):
+            cols.append(self._expect(TT.IDENT).value)
         self._expect(TT.RPAREN)
-        return CreateIndexStmt(name, table, columns, unique)
+        return CreateIndexStmt(idx_name, table, cols, unique)
 
-    def _parse_drop(self) -> DropTableStmt:
+    # ── DROP ──────────────────────────────────────────────────────
+    def _drop(self):
         self._expect(TT.DROP)
         self._expect(TT.TABLE)
-        name = self._parse_table_name()
+        name = self._expect(TT.IDENT).value
         return DropTableStmt(name)
 
-    def _parse_explain(self) -> ExplainStmt:
-        self._expect(TT.EXPLAIN)
-        stmt = self._parse_select()
-        return ExplainStmt(stmt)
-
-    # -- helpers -----------------------------------------------------------
-
-    def _parse_ident_list(self) -> list[str]:
-        names: list[str] = []
-        while True:
-            names.append(self._expect(TT.IDENT).value)
-            if not self._match(TT.COMMA):
-                break
-        return names
-
-    def _parse_expression_list(self) -> list:
-        exprs: list = []
-        while True:
-            exprs.append(self._parse_expression())
-            if not self._match(TT.COMMA):
-                break
-        return exprs
-
-    # -- expression parser (Pratt-style precedence climbing) ---------------
-
-    def _parse_expression(self, min_prec: int = 1):
-        left = self._parse_prefix()
-        while True:
-            prec, op = self._get_binary_op()
-            if prec is None or prec < min_prec:
-                break
-            if op in ("IS", "IN", "BETWEEN", "NOT_IN", "NOT_BETWEEN"):
-                left = self._parse_postfix_op(left, op)
-            else:
-                self._advance()
-                right = self._parse_expression(prec + 1)
-                left = BinaryOp(op, left, right)
-        return left
-
-    def _get_binary_op(self) -> tuple:
-        """Return (precedence, op_string) or (None, None)."""
-        tok = self._peek()
-        tt = tok.tt
-        # Check NOT IN / NOT BETWEEN via two-token lookahead
-        if tt == TT.NOT and self.pos + 1 < len(self.tokens):
-            next_tt = self.tokens[self.pos + 1].tt
-            if next_tt == TT.IN:
-                return (4, "NOT_IN")
-            if next_tt == TT.BETWEEN:
-                return (4, "NOT_BETWEEN")
-            return (None, None)
-
-        mapping = {
-            TT.OR: (1, "OR"), TT.AND: (2, "AND"),
-            TT.EQ: (4, "="), TT.NE: (4, "<>"),
-            TT.LT: (4, "<"), TT.GT: (4, ">"),
-            TT.LE: (4, "<="), TT.GE: (4, ">="),
-            TT.LIKE: (4, "LIKE"), TT.IS: (4, "IS"),
-            TT.IN: (4, "IN"), TT.BETWEEN: (4, "BETWEEN"),
-            TT.PLUS: (5, "+"), TT.MINUS: (5, "-"),
-            TT.STAR: (6, "*"), TT.SLASH: (6, "/"),
-        }
-        return mapping.get(tt, (None, None))
-
-    def _parse_prefix(self):
-        if self._at(TT.NOT):
-            self._advance()
-            return UnaryOp("NOT", self._parse_expression(3))
-        if self._at(TT.MINUS):
-            self._advance()
-            return UnaryOp("-", self._parse_expression(7))
-        return self._parse_primary()
-
-    def _parse_primary(self):
-        tok = self._peek()
-
-        # Parenthesized expression
-        if tok.tt == TT.LPAREN:
-            self._advance()
-            expr = self._parse_expression()
-            self._expect(TT.RPAREN)
-            return expr
-
-        # Literals
-        if tok.tt == TT.NUMBER:
-            self._advance()
-            return Literal(tok.value)
-        if tok.tt == TT.STRING:
-            self._advance()
-            return Literal(tok.value)
-        if tok.tt == TT.TRUE:
-            self._advance()
-            return Literal(True)
-        if tok.tt == TT.FALSE:
-            self._advance()
-            return Literal(False)
-        if tok.tt == TT.NULL:
-            self._advance()
-            return Literal(None)
-
-        # Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-        if tok.tt in _AGG_FUNCS:
-            return self._parse_agg_func()
-
-        # Identifier: column ref, table.col, or function call
-        if tok.tt == TT.IDENT:
-            self._advance()
-            name = tok.value
-            # Function call
-            if self._at(TT.LPAREN):
-                return self._parse_func_call(name)
-            # table.column or table.*
-            if self._match(TT.DOT):
-                col_tok = self._peek()
-                if col_tok.tt == TT.STAR:
-                    self._advance()
-                    return ColumnRef(name, "*")
-                col_name = self._expect(TT.IDENT).value
-                return ColumnRef(name, col_name)
-            return ColumnRef(None, name)
-
-        # Star (reachable in some expression contexts)
-        if tok.tt == TT.STAR:
-            self._advance()
-            return ColumnRef(None, "*")
-
-        raise ParseError(f"Unexpected {tok.tt.name} in expression", tok)
-
-    def _parse_agg_func(self) -> FuncCall:
-        tok = self._advance()
-        name = tok.tt.name
-        self._expect(TT.LPAREN)
-        distinct = False
-        args: list = []
-        if self._at(TT.RPAREN):
-            pass  # zero-arg (shouldn't normally happen for aggregates)
-        elif tok.tt == TT.COUNT and self._at(TT.STAR):
-            self._advance()
-            args = [ColumnRef(None, "*")]
-        else:
-            if self._match(TT.DISTINCT):
-                distinct = True
-            args = self._parse_expression_list()
-        self._expect(TT.RPAREN)
-        return FuncCall(name, args, distinct)
-
-    def _parse_func_call(self, name: str) -> FuncCall:
-        self._expect(TT.LPAREN)
-        args: list = []
-        if not self._at(TT.RPAREN):
-            args = self._parse_expression_list()
-        self._expect(TT.RPAREN)
-        return FuncCall(name.upper(), args)
-
-    def _parse_postfix_op(self, left, op: str):
-        if op == "IS":
-            self._advance()  # consume IS
-            negated = self._match(TT.NOT) is not None
-            self._expect(TT.NULL)
-            return IsNullExpr(left, negated)
-        if op == "IN":
-            self._advance()  # consume IN
-            return self._parse_in_list(left, negated=False)
-        if op == "BETWEEN":
-            self._advance()  # consume BETWEEN
-            return self._parse_between(left, negated=False)
-        if op == "NOT_IN":
-            self._advance()  # consume NOT
-            self._advance()  # consume IN
-            return self._parse_in_list(left, negated=True)
-        if op == "NOT_BETWEEN":
-            self._advance()  # consume NOT
-            self._advance()  # consume BETWEEN
-            return self._parse_between(left, negated=True)
-        raise ParseError(f"Unknown postfix op {op}")  # pragma: no cover
-
-    def _parse_in_list(self, left, negated: bool) -> InExpr:
-        self._expect(TT.LPAREN)
-        values = self._parse_expression_list()
-        self._expect(TT.RPAREN)
-        return InExpr(left, values, negated)
-
-    def _parse_between(self, left, negated: bool) -> BetweenExpr:
-        low = self._parse_expression(5)   # stop before AND at prec 2
-        self._expect(TT.AND)
-        high = self._parse_expression(5)
-        return BetweenExpr(left, low, high, negated)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
 
 def parse_sql(sql: str):
-    """Tokenize and parse a SQL string, returning an AST node."""
+    """Parse a SQL string into an AST node.
+
+    This is the public entry point for the parser module.  It
+    tokenizes the input and runs the recursive-descent parser.
+
+    Parameters
+    ----------
+    sql : str
+        A single SQL statement.
+
+    Returns
+    -------
+    AST node
+        One of ``SelectStmt``, ``InsertStmt``, ``UpdateStmt``,
+        ``DeleteStmt``, ``CreateTableStmt``, ``DropTableStmt``,
+        ``CreateIndexStmt``, ``BeginStmt``, ``CommitStmt``,
+        ``RollbackStmt``.
+
+    Raises
+    ------
+    ParseError
+        If the SQL is syntactically invalid.
+    """
     tokens = tokenize(sql)
-    parser = Parser(tokens)
-    return parser.parse()
+    return Parser(tokens).parse()
