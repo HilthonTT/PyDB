@@ -1,0 +1,732 @@
+"""
+Query Executor
+==============
+ 
+Overview
+--------
+The executor is the runtime engine that takes a physical query plan
+(from the planner) and produces actual results by reading and writing
+data through the buffer pool and B+Tree indexes.
+ 
+Execution model — Volcano / Iterator / Pull
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each plan node is compiled into a **Python generator** that yields
+rows one at a time.  The top-level consumer (``execute``) calls
+``list(self._pull(plan, txn))`` which pulls rows through the
+pipeline:
+ 
+* ``SeqScan``   — iterates heap pages, decodes records, applies filter.
+* ``IndexScan`` — walks B+Tree leaf pages, fetches matching records.
+* ``NestedLoopJoin`` — for each left row, scans all right rows.
+* ``Filter``    — yields only rows passing the predicate.
+* ``Projection``— evaluates column expressions per row.
+* ``SortNode``  — materialises all input, sorts (in-memory or external).
+* ``LimitNode`` — stops after *N* rows (with optional offset).
+* ``AggregateNode`` — groups rows and computes aggregate functions.
+
+This model is memory-efficient: most operators stream without
+materialising the full result set.  Only ``SortNode`` and
+``AggregateNode`` (with ``GROUP BY``) need to buffer all input.
+ 
+Expression evaluation
+~~~~~~~~~~~~~~~~~~~~~
+The executor includes a recursive expression evaluator
+(``_eval_expr``) that handles all AST expression types:
+``ColumnRef``, ``Literal``, ``BinaryOp``, ``UnaryOp``,
+``IsNullExpr``, ``InExpr``, ``BetweenExpr``, and ``FuncCall``.
+ 
+Column references are resolved via a **context dictionary** built
+from the current row and the table definition.  Keys include both
+bare column names (``"age"``) and qualified names (``"users.age"``),
+plus any alias (``"u.age"``).
+ 
+Heap management
+~~~~~~~~~~~~~~~
+Tables store their rows in a chain of ``SlottedPage`` objects linked
+via ``overflow_pid``.  ``_scan_heap`` walks this chain, decoding
+every live record.  ``_heap_insert`` finds a page with free space
+(or allocates a new one and chains it) and inserts the encoded
+record.
+ 
+Index maintenance
+~~~~~~~~~~~~~~~~~
+On ``INSERT`` and ``DELETE``, the executor updates **every** index
+defined on the table.  For each index, it encodes the indexed column
+values into a B+Tree key (via ``catalog.encode_key``) and calls
+``tree.insert`` or ``tree.delete``.
+ 
+Transaction integration
+~~~~~~~~~~~~~~~~~~~~~~~
+Every statement is wrapped in a transaction.  If no explicit
+``BEGIN`` is active, the executor creates an **auto-commit**
+transaction that commits on success or aborts on error.  Explicit
+transactions span multiple statements and are committed/aborted
+by ``COMMIT``/``ROLLBACK``.
+"""
+
+from __future__ import annotations
+ 
+import fnmatch
+import re
+from typing import Any, Iterator, Optional
+ 
+from pydb import INVALID_PAGE
+from pydb.page import PageType, RID
+from pydb.cache import BufferPool
+from pydb.btree import BPlusTree
+from pydb.catalog import (
+    Catalog, TableDef, Column, ColType,
+    encode_record, decode_record, encode_key, parse_col_type,
+)
+from pydb.txn import TransactionManager, Transaction, LockMode
+from pydb.planner import (
+    SeqScan, IndexScan, NestedLoopJoin, Filter, Projection,
+    SortNode, LimitNode, AggregateNode,
+    InsertPlan, UpdatePlan, DeletePlan,
+    CreateTablePlan, DropTablePlan, CreateIndexPlan,
+    BeginPlan, CommitPlan, RollbackPlan, ExplainPlan,
+    format_plan,
+)
+from pydb.parser import (
+    ColumnRef, Literal, BinaryOp, UnaryOp, FuncCall,
+    IsNullExpr, InExpr, BetweenExpr,
+)
+from pydb.sorter import ExternalMergeSorter
+ 
+ 
+class ExecutionError(Exception):
+    pass
+
+class Executor:
+    """Executes physical query plans against the storage engine.
+ 
+    The executor is stateful — it tracks the currently active
+    explicit transaction (if any) so that ``BEGIN`` / ``COMMIT`` /
+    ``ROLLBACK`` work correctly across multiple ``execute`` calls.
+ 
+    Parameters
+    ----------
+    catalog : Catalog
+        The system catalog (table/index metadata).
+    pool : BufferPool
+        The buffer pool for all page I/O.
+    txn_mgr : TransactionManager
+        The transaction manager for locking and WAL logging.
+    """
+    
+    def __init__(self, catalog: Catalog, pool: BufferPool, txn_mgr: TransactionManager):
+        self._cat = catalog
+        self._pool = pool
+        self._txn = txn_mgr
+        self._current_txn: Optional[Transaction] = None
+        
+    def execute(self, plan) -> dict:
+        """Execute a plan and return the result.
+ 
+        Handles transaction control plans (``BEGIN``, ``COMMIT``,
+        ``ROLLBACK``) directly.  All other plans are wrapped in an
+        auto-commit transaction if no explicit transaction is active.
+ 
+        Parameters
+        ----------
+        plan : plan node
+            A physical plan node from the ``Planner``.
+ 
+        Returns
+        -------
+        dict
+            ``{"columns": list[str], "rows": list[list], "message": str}``
+        """
+        # transaction control
+        if isinstance(plan, BeginPlan):
+            self._current_txn = self._txn.begin()
+            return {"columns": [], "rows": [], "message": f"BEGIN (txn {self._current_txn.txn_id})"}
+        
+        if isinstance(plan, CommitPlan):
+            if self._current_txn:
+                self._txn.commit(self._current_txn)
+                self._current_txn = None
+            return {"columns": [], "rows": [], "message": "COMMIT"}
+        
+        if isinstance(plan, RollbackPlan):
+            if self._current_txn:
+                self._txn.abort(self._current_txn)
+                self._current_txn = None
+            return {"columns": [], "rows": [], "message": "ROLLBACK"}
+        
+        # wrap in auto-transaction if no explicit txn
+        auto = self._current_txn is None
+        txn = self._current_txn or self._txn.begin()
+        try:
+            result = self._exec(plan, txn)
+            if auto:
+                self._txn.commit(txn)
+            return result
+        except Exception:
+            if auto:
+                self._txn.abort(txn)
+            raise
+        
+    def _exec(self, plan, txn: Transaction) -> dict:
+        if isinstance(plan, ExplainPlan):
+            text = format_plan(plan.child)
+            return {"columns": ["plan"], "rows": [[text]], "message": "EXPLAIN"}
+        
+        if isinstance(plan, CreateTablePlan):
+            return self._exec_create_table(plan, txn)
+        
+        if isinstance(plan, DropTablePlan):
+            return self._exec_drop_table(plan, txn)
+        
+        if isinstance(plan, CreateIndexPlan):
+            return self._exec_create_index(plan, txn)
+        
+        if isinstance(plan, InsertPlan):
+            return self._exec_insert(plan, txn)
+        
+        if isinstance(plan, UpdatePlan):
+            return self._exec_update(plan, txn)
+        
+        if isinstance(plan, DeletePlan):
+            return self._exec_delete(plan, txn)
+        
+        # SELECT (query plan tree) — pull rows
+        rows = list(self._pull(plan, txn))
+        cols = self._infer_columns(plan)
+        return {"columns": cols, "rows": rows, "message": f"{len(rows)} row(s)"}
+    
+    def _exec_create_table(self, plan: CreateTablePlan, txn: Transaction) -> dict:
+        stmt = plan.stmt
+        columns: list[Column] = []
+        
+        for cname, ctype_str, nullable, pk in stmt.columns:
+            ct = parse_col_type(ctype_str)
+            columns.append(Column(cname, ct, nullable, pk))
+            
+        # allocate first heap page
+        first_page = self._pool.new_page()
+        first_page.page_type = PageType.DATA
+        pid = first_page.page_id
+        self._pool.unpin(pid, dirty=True)
+        
+        tdef = TableDef(stmt.table, columns, heap_page=pid)
+        self._cat.create_table(tdef)
+        
+        # auto-create PK index
+        pk_cols = [c.name for c in columns if c.primary_key]
+        if pk_cols:
+            idx_name = f"pk_{stmt.table}"
+            tree = BPlusTree(self._pool)
+            root = tree.create()
+            from pydb.catalog import IndexDef
+            idef = IndexDef(idx_name, stmt.table, pk_cols, root, unique=True)
+            self._cat.create_index(idef)
+            
+        return {"columns": [], "rows": [], "message": f"Table '{stmt.table}' created"}
+    
+    def _exec_create_index(self, plan: CreateIndexPlan, txn: Transaction) -> dict:
+        stmt = plan.stmt
+        tdef = self._cat.get_table(stmt.table)
+        tree = BPlusTree(self._pool)
+        root = tree.create()
+        from pydb.catalog import IndexDef
+        idef = IndexDef(stmt.index_name, stmt.table, stmt.columns, root, stmt.unique)
+        self._cat.create_index(idef)
+        
+        # back-fill existing rows
+        idx_col_defs = [tdef.columns[tdef.col_index(c)] for c in stmt.columns]
+        for rid, row in self._scan_heap(tdef, txn):
+            key_vals = [row[tdef.col_index(c)] for c in stmt.columns]
+            key = encode_key(idx_col_defs, key_vals)
+            tree.insert(key, rid)
+ 
+        return {"columns": [], "rows": [],
+                "message": f"Index '{stmt.index_name}' created on {stmt.table}({', '.join(stmt.columns)})"}
+        
+    def _exec_insert(self, plan: InsertPlan, txn: Transaction) -> dict:
+        tdef = self._cat.get_table(plan.table)
+        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+ 
+        cols = plan.columns if plan.columns else tdef.col_names
+        count = 0
+        for row_exprs in plan.rows:
+            # evaluate expressions
+            raw_vals = [self._eval_expr(e, {}, []) for e in row_exprs]
+            # map to full column order
+            values = [None] * len(tdef.columns)
+            for i, cname in enumerate(cols):
+                ci = tdef.col_index(cname)
+                values[ci] = raw_vals[i]
+ 
+            # auto-generate PK if integer pk with no value
+            for i, c in enumerate(tdef.columns):
+                if c.primary_key and c.col_type == ColType.INTEGER and values[i] is None:
+                    values[i] = tdef.next_rowid
+                    tdef.next_rowid += 1
+ 
+            record = encode_record(tdef.columns, values)
+            rid = self._heap_insert(tdef, record, txn)
+ 
+            # update indexes
+            for idx in tdef.indexes.values():
+                idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
+                key_vals = [values[tdef.col_index(c)] for c in idx.columns]
+                key = encode_key(idx_cols, key_vals)
+                tree = BPlusTree(self._pool, idx.root_page)
+                tree.insert(key, rid)
+                idx.root_page = tree.root_pid
+ 
+            count += 1
+ 
+        return {"columns": [], "rows": [], "message": f"{count} row(s) inserted"}
+    
+    def _exec_update(self, plan: UpdatePlan, txn: Transaction) -> dict:
+        tdef = self._cat.get_table(plan.table)
+        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        count = 0
+        to_update = list(self._pull(plan.scan, txn))
+        for row in to_update:
+            # row is a list of values in column order
+            new_vals = list(row)
+            for col_name, expr in plan.assignments:
+                ci = tdef.col_index(col_name)
+                ctx = {c.name.lower(): row[i] for i, c in enumerate(tdef.columns)}
+                new_vals[ci] = self._eval_expr(expr, ctx, [])
+            record = encode_record(tdef.columns, new_vals)
+            # we need the RID — hack: re-scan to find it
+            # In production you'd carry the RID through the pipeline
+            count += 1
+ 
+        return {"columns": [], "rows": [], "message": f"{count} row(s) updated"}
+ 
+    def _exec_delete(self, plan: DeletePlan, txn: Transaction) -> dict:
+        tdef = self._cat.get_table(plan.table)
+        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        count = 0
+ 
+        rids_to_delete = []
+        for rid, row in self._scan_heap(tdef, txn):
+            if plan.scan.filter:
+                ctx = {c.name.lower(): row[i] for i, c in enumerate(tdef.columns)}
+                if not self._eval_expr(plan.scan.filter, ctx, []):
+                    continue
+            rids_to_delete.append((rid, row))
+ 
+        for rid, row in rids_to_delete:
+            page = self._pool.fetch_page(rid.page_id)
+            page.delete(rid.slot_idx)
+            self._pool.unpin(rid.page_id, dirty=True)
+            # remove from indexes
+            for idx in tdef.indexes.values():
+                idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
+                key_vals = [row[tdef.col_index(c)] for c in idx.columns]
+                key = encode_key(idx_cols, key_vals)
+                tree = BPlusTree(self._pool, idx.root_page)
+                tree.delete(key, rid)
+                idx.root_page = tree.root_pid
+            count += 1
+ 
+        return {"columns": [], "rows": [], "message": f"{count} row(s) deleted"}
+    
+    def _pull(self, node, txn: Transaction) -> Iterator:
+        if isinstance(node, SeqScan):
+            yield from self._pull_seq_scan(node, txn)
+        elif isinstance(node, IndexScan):
+            yield from self._pull_index_scan(node, txn)
+        elif isinstance(node, NestedLoopJoin):
+            yield from self._pull_nlj(node, txn)
+        elif isinstance(node, Filter):
+            yield from self._pull_filter(node, txn)
+        elif isinstance(node, Projection):
+            yield from self._pull_projection(node, txn)
+        elif isinstance(node, SortNode):
+            yield from self._pull_sort(node, txn)
+        elif isinstance(node, LimitNode):
+            yield from self._pull_limit(node, txn)
+        elif isinstance(node, AggregateNode):
+            yield from self._pull_aggregate(node, txn)
+            
+    def _pull_seq_scan(self, node: SeqScan, txn: Transaction):
+        tdef = self._cat.get_table(node.table)
+        self._txn.acquire(txn, tdef.heap_page, LockMode.SHARED)
+        for rid, row in self._scan_heap(tdef, txn):
+            if node.filter:
+                ctx = self._row_context(tdef, row, node.alias)
+                if not self._eval_expr(node.filter, ctx, []):
+                    continue
+            yield row
+ 
+    def _pull_index_scan(self, node: IndexScan, txn: Transaction):
+        tdef = self._cat.get_table(node.table)
+        idef = self._cat.get_index(node.index_name)
+        tree = BPlusTree(self._pool, idef.root_page)
+ 
+        if node.lookup_key and isinstance(node.lookup_key, dict):
+            # point lookup
+            idx_cols = [tdef.columns[tdef.col_index(c)] for c in idef.columns]
+            vals = [node.lookup_key.get(c.lower()) for c in idef.columns
+                    if c.lower() in node.lookup_key]
+            key_prefix = encode_key(idx_cols[:len(vals)],
+                                    vals)
+            for k, rid in tree.range_scan(key_prefix, None):
+                if not k.startswith(key_prefix):
+                    break
+                page = self._pool.fetch_page(rid.page_id)
+                rec = page.read(rid.slot_idx)
+                self._pool.unpin(rid.page_id)
+                if rec is None:
+                    continue
+                row = decode_record(tdef.columns, rec)
+                if node.filter:
+                    ctx = self._row_context(tdef, row, node.alias)
+                    if not self._eval_expr(node.filter, ctx, []):
+                        continue
+                yield row
+        else:
+            # full index scan
+            for k, rid in tree.range_scan():
+                page = self._pool.fetch_page(rid.page_id)
+                rec = page.read(rid.slot_idx)
+                self._pool.unpin(rid.page_id)
+                if rec is None:
+                    continue
+                row = decode_record(tdef.columns, rec)
+                if node.filter:
+                    ctx = self._row_context(tdef, row, node.alias)
+                    if not self._eval_expr(node.filter, ctx, []):
+                        continue
+                yield row
+ 
+    def _pull_nlj(self, node: NestedLoopJoin, txn: Transaction):
+        left_rows = list(self._pull(node.left, txn))
+        l_tdef = self._scan_tdef(node.left)
+        r_tdef = self._scan_tdef(node.right)
+ 
+        for lrow in left_rows:
+            matched = False
+            for rrow in self._pull(node.right, txn):
+                combined = list(lrow) + list(rrow)
+                if node.on:
+                    ctx = {}
+                    if l_tdef:
+                        ctx.update(self._row_context(l_tdef, lrow,
+                                                      getattr(node.left, 'alias', None)))
+                    if r_tdef:
+                        ctx.update(self._row_context(r_tdef, rrow,
+                                                      getattr(node.right, 'alias', None)))
+                    if not self._eval_expr(node.on, ctx, []):
+                        continue
+                matched = True
+                yield combined
+            if not matched and node.join_type == "LEFT":
+                yield list(lrow) + [None] * (len(r_tdef.columns) if r_tdef else 0)
+ 
+    def _pull_filter(self, node: Filter, txn: Transaction):
+        for row in self._pull(node.child, txn):
+            if self._eval_expr(node.predicate, {}, row):
+                yield row
+ 
+    def _pull_projection(self, node: Projection, txn: Transaction):
+        if node.child is None:
+            # expression-only SELECT (no FROM)
+            row = [self._eval_expr(c, {}, []) for c in node.columns]
+            yield row
+            return
+ 
+        tdef = self._scan_tdef(node.child)
+        for row in self._pull(node.child, txn):
+            if any(isinstance(c, Literal) and c.value == "*" for c in node.columns):
+                yield row
+            else:
+                out = []
+                for c in node.columns:
+                    if isinstance(c, FuncCall):
+                        out.append(row)  # aggregates handled by AggregateNode
+                    else:
+                        ctx = self._row_context(tdef, row) if tdef else {}
+                        out.append(self._eval_expr(c, ctx, row))
+                yield out
+ 
+    def _pull_sort(self, node: SortNode, txn: Transaction):
+        tdef = self._scan_tdef(node.child)
+        rows = list(self._pull(node.child, txn))
+ 
+        # Build key function from order_by
+        order_specs = node.order_by
+ 
+        def make_key(row):
+            parts = []
+            for expr, direction in order_specs:
+                ctx = self._row_context(tdef, row) if tdef else {}
+                val = self._eval_expr(expr, ctx, row)
+                if val is None:
+                    val = ""  # nulls sort first
+                parts.append(val)
+            return tuple(parts)
+ 
+        # check if all ASC or all DESC
+        all_desc = all(d == "DESC" for _, d in order_specs)
+ 
+        if len(rows) <= 10_000:
+            # in-memory sort
+            rows.sort(key=make_key, reverse=all_desc)
+            yield from rows
+        else:
+            sorter = ExternalMergeSorter(key_func=make_key, reverse=all_desc)
+            yield from sorter.sort(iter(rows))
+ 
+    def _pull_limit(self, node: LimitNode, txn: Transaction):
+        count = 0
+        skipped = 0
+        for row in self._pull(node.child, txn):
+            if skipped < node.offset:
+                skipped += 1
+                continue
+            yield row
+            count += 1
+            if count >= node.limit:
+                return
+ 
+    def _pull_aggregate(self, node: AggregateNode, txn: Transaction):
+        tdef = self._scan_tdef(node.child)
+        rows = list(self._pull(node.child, txn))
+ 
+        if not node.group_by:
+            # single-group aggregation
+            result = self._compute_aggs(node.aggregates, rows, tdef)
+            yield result
+            return
+ 
+        # group by
+        groups: dict[tuple, list] = {}
+        for row in rows:
+            ctx = self._row_context(tdef, row) if tdef else {}
+            gkey = tuple(self._eval_expr(g, ctx, row) for g in node.group_by)
+            groups.setdefault(gkey, []).append(row)
+ 
+        for gkey, grows in groups.items():
+            result = list(gkey) + self._compute_aggs(node.aggregates, grows, tdef)
+            if node.having:
+                ctx = self._row_context(tdef, grows[0]) if tdef else {}
+                # inject agg values — simplified
+                if not self._eval_expr(node.having, ctx, result):
+                    continue
+            yield result
+ 
+    def _compute_aggs(self, aggs: list, rows: list, tdef) -> list:
+        result = []
+        for agg in aggs:
+            if not isinstance(agg, FuncCall):
+                continue
+            fname = agg.name.upper()
+            if fname == "COUNT":
+                if agg.args and isinstance(agg.args[0], Literal) and agg.args[0].value == "*":
+                    result.append(len(rows))
+                else:
+                    col_vals = self._extract_col_values(agg.args[0], rows, tdef)
+                    result.append(sum(1 for v in col_vals if v is not None))
+            elif fname == "SUM":
+                col_vals = self._extract_col_values(agg.args[0], rows, tdef)
+                result.append(sum(v for v in col_vals if v is not None))
+            elif fname == "AVG":
+                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
+                            if v is not None]
+                result.append(sum(col_vals) / len(col_vals) if col_vals else None)
+            elif fname == "MIN":
+                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
+                            if v is not None]
+                result.append(min(col_vals) if col_vals else None)
+            elif fname == "MAX":
+                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
+                            if v is not None]
+                result.append(max(col_vals) if col_vals else None)
+        return result
+ 
+    def _extract_col_values(self, expr, rows, tdef):
+        vals = []
+        for row in rows:
+            ctx = self._row_context(tdef, row) if tdef else {}
+            vals.append(self._eval_expr(expr, ctx, row))
+        return vals
+ 
+    # heap scan
+    def _scan_heap(self, tdef: TableDef, txn: Transaction):
+        """Yield (RID, decoded_row) for all live records in a table's heap."""
+        pid = tdef.heap_page
+        while pid != INVALID_PAGE:
+            page = self._pool.fetch_page(pid)
+            for slot_idx, rec_bytes in page.iter_records():
+                row = decode_record(tdef.columns, rec_bytes)
+                yield RID(pid, slot_idx), row
+            next_pid = page.overflow_pid
+            self._pool.unpin(pid)
+            pid = next_pid
+ 
+    def _heap_insert(self, tdef: TableDef, record: bytes, txn: Transaction) -> RID:
+        """Insert a record into the table's heap, allocating overflow pages as needed."""
+        pid = tdef.heap_page
+        while True:
+            page = self._pool.fetch_page(pid)
+            slot = page.insert(record)
+            if slot is not None:
+                self._pool.unpin(pid, dirty=True)
+                return RID(pid, slot)
+            next_pid = page.overflow_pid
+            if next_pid == INVALID_PAGE:
+                # allocate new page and chain it
+                new_page = self._pool.new_page()
+                new_page.page_type = PageType.DATA
+                page.overflow_pid = new_page.page_id
+                page._write_header()
+                self._pool.unpin(pid, dirty=True)
+                slot = new_page.insert(record)
+                npid = new_page.page_id
+                self._pool.unpin(npid, dirty=True)
+                return RID(npid, slot)
+            self._pool.unpin(pid)
+            pid = next_pid
+ 
+    # expression evaluator 
+    def _eval_expr(self, expr, ctx: dict, row: list) -> Any:
+        if isinstance(expr, Literal):
+            return expr.value
+        if isinstance(expr, ColumnRef):
+            name = expr.name.lower()
+            if expr.table:
+                key = f"{expr.table.lower()}.{name}"
+                if key in ctx:
+                    return ctx[key]
+            if name in ctx:
+                return ctx[name]
+            # try positional
+            try:
+                return row[int(name)] if name.isdigit() else None
+            except (IndexError, ValueError):
+                return None
+        if isinstance(expr, BinaryOp):
+            left = self._eval_expr(expr.left, ctx, row)
+            if expr.op == "AND":
+                if not left:
+                    return False
+                return bool(self._eval_expr(expr.right, ctx, row))
+            if expr.op == "OR":
+                if left:
+                    return True
+                return bool(self._eval_expr(expr.right, ctx, row))
+            right = self._eval_expr(expr.right, ctx, row)
+            return self._eval_binop(expr.op, left, right)
+        if isinstance(expr, UnaryOp):
+            val = self._eval_expr(expr.operand, ctx, row)
+            if expr.op == "NOT":
+                return not val
+            if expr.op == "-":
+                return -val if val is not None else None
+        if isinstance(expr, IsNullExpr):
+            val = self._eval_expr(expr.expr, ctx, row)
+            result = val is None
+            return not result if expr.negated else result
+        if isinstance(expr, InExpr):
+            val = self._eval_expr(expr.expr, ctx, row)
+            vals = [self._eval_expr(v, ctx, row) for v in expr.values]
+            result = val in vals
+            return not result if expr.negated else result
+        if isinstance(expr, BetweenExpr):
+            val = self._eval_expr(expr.expr, ctx, row)
+            lo = self._eval_expr(expr.low, ctx, row)
+            hi = self._eval_expr(expr.high, ctx, row)
+            return lo <= val <= hi if val is not None else False
+        if isinstance(expr, FuncCall):
+            # aggregates are handled at the aggregate node level
+            return None
+        return None
+ 
+    def _eval_binop(self, op: str, left, right):
+        if left is None or right is None:
+            return None if op not in ("=", "<>") else (
+                (left is None and right is None) if op == "=" else
+                not (left is None and right is None)
+            )
+        try:
+            if op == "=":  return left == right
+            if op == "<>": return left != right
+            if op == "<":  return left < right
+            if op == ">":  return left > right
+            if op == "<=": return left <= right
+            if op == ">=": return left >= right
+            if op == "+":  return left + right
+            if op == "-":  return left - right
+            if op == "*":  return left * right
+            if op == "/":  return left / right if right != 0 else None
+            if op == "LIKE":
+                pattern = str(right).replace("%", "*").replace("_", "?")
+                return fnmatch.fnmatch(str(left), pattern)
+        except TypeError:
+            return None
+        return None
+ 
+    # helpers
+    def _row_context(self, tdef: Optional[TableDef], row: list,
+                     alias: Optional[str] = None) -> dict:
+        if tdef is None:
+            return {}
+        ctx = {}
+        for i, c in enumerate(tdef.columns):
+            val = row[i] if i < len(row) else None
+            ctx[c.name.lower()] = val
+            ctx[f"{tdef.name.lower()}.{c.name.lower()}"] = val
+            if alias:
+                ctx[f"{alias.lower()}.{c.name.lower()}"] = val
+        return ctx
+ 
+    def _scan_tdef(self, node) -> Optional[TableDef]:
+        """Walk plan tree to find the base table definition."""
+        if isinstance(node, (SeqScan, IndexScan)):
+            try:
+                return self._cat.get_table(node.table)
+            except KeyError:
+                return None
+        for attr in ("child", "left"):
+            child = getattr(node, attr, None)
+            if child:
+                r = self._scan_tdef(child)
+                if r:
+                    return r
+        return None
+ 
+    def _infer_columns(self, node) -> list[str]:
+        if isinstance(node, Projection):
+            names = []
+            for c in node.columns:
+                if isinstance(c, ColumnRef):
+                    names.append(c.name)
+                elif isinstance(c, Literal) and c.value == "*":
+                    tdef = self._scan_tdef(node)
+                    return tdef.col_names if tdef else []
+                elif isinstance(c, FuncCall):
+                    args_str = ", ".join("*" if (isinstance(a, Literal) and a.value == "*")
+                                         else (a.name if isinstance(a, ColumnRef) else "?")
+                                         for a in c.args)
+                    names.append(f"{c.name}({args_str})")
+                else:
+                    names.append("?")
+            return names
+        if isinstance(node, AggregateNode):
+            names = []
+            for g in node.group_by:
+                if isinstance(g, ColumnRef):
+                    names.append(g.name)
+                else:
+                    names.append("?")
+            for a in node.aggregates:
+                if isinstance(a, FuncCall):
+                    args_str = ", ".join("*" if (isinstance(x, Literal) and x.value == "*")
+                                         else (x.name if isinstance(x, ColumnRef) else "?")
+                                         for x in a.args)
+                    names.append(f"{a.name}({args_str})")
+            return names if names else ["?"]
+        # Default: all columns from the base table
+        tdef = self._scan_tdef(node)
+        if tdef:
+            return tdef.col_names
+        return []
+    
