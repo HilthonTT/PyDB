@@ -150,7 +150,7 @@ class BufferPool:
         with self._lock:
             if page_id in self._frames:
                 f = self._frames[page_id]
-                f.pin_count = 1
+                f.pin_count += 1
                 self._touch(f)
                 return f.page
             

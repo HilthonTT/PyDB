@@ -353,31 +353,32 @@ class SlottedPage:
           The slot index where the record was placed, or ``None``
           if the page does not have enough free space.
       """
-      needed = len(data) + SLOT_ENTRY_SIZE
-      if needed > self.free_space:
-        return None
-      
-      # allocate record space from the end.
-      rec_offset = self.free_end - len(data)
-      self._buf[rec_offset:rec_offset + len(data)] = data
-      
-      # find a tombstoned slot or append
+      # find a tombstoned slot to reuse
       slot_idx = None
       for i in range(self.num_slots):
         so, sl = self._read_slot(i)
         if so == 0 and sl == 0:
           slot_idx = i
           break
-        
-        if slot_idx is None:
-          slot_idx = self.num_slots
-          self.num_slots += 1
-          self.free_offset = HEADER_SIZE + self.num_slots * SLOT_ENTRY_SIZE
-          
-        self._write_slot(i, rec_offset, len(data))
-        self.free_end = rec_offset
-        self._write_header()
-        return slot_idx
+
+      # calculate space needed — no extra SLOT_ENTRY_SIZE if reusing a tombstone
+      needed = len(data) + (0 if slot_idx is not None else SLOT_ENTRY_SIZE)
+      if needed > self.free_space:
+        return None
+
+      # allocate record space from the end
+      rec_offset = self.free_end - len(data)
+      self._buf[rec_offset:rec_offset + len(data)] = data
+
+      if slot_idx is None:
+        slot_idx = self.num_slots
+        self.num_slots += 1
+        self.free_offset = HEADER_SIZE + self.num_slots * SLOT_ENTRY_SIZE
+
+      self._write_slot(slot_idx, rec_offset, len(data))
+      self.free_end = rec_offset
+      self._write_header()
+      return slot_idx
       
     def read(self, slot_idx: int) -> Optional[bytes]:
       """Read the record at slot *slot_idx*.

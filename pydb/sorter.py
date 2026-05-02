@@ -143,19 +143,24 @@ class ExternalMergeSorter:
         
         # Phase 2 - multi-pass K-way merge
         runs = list(self._run_files)
-        while len(runs) > 1:
-            next_runs: list[Path] = []
-            for i in range(0, len(runs), self._k):
-                group = runs[i:i + self._k]
-                if len(group) == 1:
-                    next_runs.append(group[0])
-                else:
-                    merged = self._merge_runs(group)
-                    next_runs.append(merged)
-                    for p in group:
-                        p.unlink(missing_ok=True)
-            runs = next_runs
-            
+        try:
+            while len(runs) > 1:
+                next_runs: list[Path] = []
+                for i in range(0, len(runs), self._k):
+                    group = runs[i:i + self._k]
+                    if len(group) == 1:
+                        next_runs.append(group[0])
+                    else:
+                        merged = self._merge_runs(group)
+                        next_runs.append(merged)
+                        for p in group:
+                            p.unlink(missing_ok=True)
+                runs = next_runs
+        except Exception:
+            for p in runs:
+                p.unlink(missing_ok=True)
+            raise
+
         return self._read_run(runs[0])
     
     def cleanup(self):

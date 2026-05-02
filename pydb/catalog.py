@@ -130,7 +130,7 @@ def parse_col_type(s: str) -> ColType:
         If the type string is not recognised.
     """
     s = s.upper().split("(")[0].strip()
-    ct = _TYPE_MAP[s]
+    ct = _TYPE_MAP.get(s)
     if ct is None:
         raise ValueError(f"Unknown column type: {s}")
     return ct
@@ -263,7 +263,7 @@ class Catalog:
         Raises ``KeyError`` if the table does not exist.
         """
         key = name.lower()
-        t = self.tables.pop(key)
+        t = self.tables.pop(key, None)
         if t is None:
             raise KeyError(f"Table '{name}' does not exist")
         for idx_name in list(t.indexes):

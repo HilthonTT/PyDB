@@ -269,6 +269,8 @@ class Planner:
         aggs = [c for c in stmt.columns if isinstance(c, FuncCall)]
         if stmt.group_by or aggs:
             plan = AggregateNode(plan, stmt.group_by, aggs, stmt.having)
+            # add projection to ensure correct column order
+            plan = Projection(plan, stmt.columns)
             # limit / offset
             if stmt.limit is not None:
                 plan = LimitNode(plan, stmt.limit, stmt.offset or 0)

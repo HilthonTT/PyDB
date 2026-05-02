@@ -294,6 +294,10 @@ class DiskManager:
             removed from the buffer pool first).
         """
         with self._lock:
+            if page_id == 0:
+                raise ValueError("Cannot deallocate meta page (page 0)")
+            if page_id >= self.page_count:
+                raise ValueError(f"Page {page_id} is out of range (page_count={self.page_count})")
             self._fp.seek(page_id * PAGE_SIZE)
             self._fp.write(struct.pack("<I", self.free_head))
             self.free_head = page_id

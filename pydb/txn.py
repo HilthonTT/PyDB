@@ -156,7 +156,7 @@ class LockManager:
         
     def _ensure(self, page_id: int) -> dict:
         """Lazily create a lock entry for *page_id* if none exists."""
-        if page_id not in self._lock:
+        if page_id not in self._table:
             self._table[page_id] = {
                 "S": set(),
                 "X": None,
@@ -227,7 +227,9 @@ class LockManager:
         with self._lock:
             for entry in self._table.values():
                 changed = False
-                entry["S"].discard(txn_id)
+                if txn_id in entry["S"]:
+                    entry["S"].discard(txn_id)
+                    changed = True
                 if entry["X"] == txn_id:
                     entry["X"] = None
                     changed = True

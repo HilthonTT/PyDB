@@ -65,11 +65,11 @@ by ``COMMIT``/``ROLLBACK``.
 """
 
 from __future__ import annotations
- 
+
 import fnmatch
-import re
+import threading
 from typing import Any, Iterator, Optional
- 
+
 from pydb import INVALID_PAGE
 from pydb.page import PageType, RID
 from pydb.cache import BufferPool
@@ -94,6 +94,52 @@ from pydb.parser import (
 from pydb.sorter import ExternalMergeSorter
  
  
+class _NullSentinel:
+    """Sentinel for NULL values in sort keys. Sorts before/after all real values."""
+    __slots__ = ("_first",)
+    def __init__(self, first: bool = True):
+        self._first = first
+    def __lt__(self, other):
+        if isinstance(other, _NullSentinel):
+            return False
+        return self._first
+    def __gt__(self, other):
+        if isinstance(other, _NullSentinel):
+            return False
+        return not self._first
+    def __le__(self, other):
+        return not self.__gt__(other)
+    def __ge__(self, other):
+        return not self.__lt__(other)
+    def __eq__(self, other):
+        return isinstance(other, _NullSentinel)
+
+class _ReverseKey:
+    """Wrapper that reverses comparison order for DESC sort columns."""
+    __slots__ = ("val",)
+    def __init__(self, val):
+        self.val = val
+    def __lt__(self, other):
+        if isinstance(other, _NullSentinel):
+            return not other.__lt__(self)
+        if isinstance(other, _ReverseKey):
+            return self.val > other.val
+        return self.val > other
+    def __gt__(self, other):
+        if isinstance(other, _NullSentinel):
+            return not other.__gt__(self)
+        if isinstance(other, _ReverseKey):
+            return self.val < other.val
+        return self.val < other
+    def __le__(self, other):
+        return not self.__gt__(other)
+    def __ge__(self, other):
+        return not self.__lt__(other)
+    def __eq__(self, other):
+        if isinstance(other, _ReverseKey):
+            return self.val == other.val
+        return False
+
 class ExecutionError(Exception):
     pass
 
@@ -118,7 +164,7 @@ class Executor:
         self._cat = catalog
         self._pool = pool
         self._txn = txn_mgr
-        self._current_txn: Optional[Transaction] = None
+        self._local = threading.local()
         
     def execute(self, plan) -> dict:
         """Execute a plan and return the result.
@@ -139,24 +185,28 @@ class Executor:
         """
         # transaction control
         if isinstance(plan, BeginPlan):
-            self._current_txn = self._txn.begin()
-            return {"columns": [], "rows": [], "message": f"BEGIN (txn {self._current_txn.txn_id})"}
-        
+            txn = self._txn.begin()
+            self._local.current_txn = txn
+            return {"columns": [], "rows": [], "message": f"BEGIN (txn {txn.txn_id})"}
+
         if isinstance(plan, CommitPlan):
-            if self._current_txn:
-                self._txn.commit(self._current_txn)
-                self._current_txn = None
+            cur = getattr(self._local, 'current_txn', None)
+            if cur:
+                self._txn.commit(cur)
+                self._local.current_txn = None
             return {"columns": [], "rows": [], "message": "COMMIT"}
-        
+
         if isinstance(plan, RollbackPlan):
-            if self._current_txn:
-                self._txn.abort(self._current_txn)
-                self._current_txn = None
+            cur = getattr(self._local, 'current_txn', None)
+            if cur:
+                self._txn.abort(cur)
+                self._local.current_txn = None
             return {"columns": [], "rows": [], "message": "ROLLBACK"}
-        
+
         # wrap in auto-transaction if no explicit txn
-        auto = self._current_txn is None
-        txn = self._current_txn or self._txn.begin()
+        cur = getattr(self._local, 'current_txn', None)
+        auto = cur is None
+        txn = cur or self._txn.begin()
         try:
             result = self._exec(plan, txn)
             if auto:
@@ -223,7 +273,29 @@ class Executor:
             self._cat.create_index(idef)
             
         return {"columns": [], "rows": [], "message": f"Table '{stmt.table}' created"}
-    
+
+    def _exec_drop_table(self, plan: DropTablePlan, txn: Transaction) -> dict:
+        table_name = plan.table
+        tdef = self._cat.get_table(table_name)
+        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+
+        # Deallocate all heap pages
+        pid = tdef.heap_page
+        while pid != INVALID_PAGE:
+            page = self._pool.fetch_page(pid)
+            next_pid = page.overflow_pid
+            self._pool.unpin(pid)
+            self._pool.delete_page(pid)
+            pid = next_pid
+
+        # Deallocate index root pages
+        for idx in tdef.indexes.values():
+            if idx.root_page != INVALID_PAGE:
+                self._pool.delete_page(idx.root_page)
+
+        self._cat.drop_table(table_name)
+        return {"columns": [], "rows": [], "message": f"Table '{table_name}' dropped"}
+
     def _exec_create_index(self, plan: CreateIndexPlan, txn: Transaction) -> dict:
         stmt = plan.stmt
         tdef = self._cat.get_table(stmt.table)
@@ -284,17 +356,43 @@ class Executor:
         tdef = self._cat.get_table(plan.table)
         self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
         count = 0
-        to_update = list(self._pull(plan.scan, txn))
-        for row in to_update:
-            # row is a list of values in column order
+
+        # Collect (RID, old_row) pairs matching the filter
+        rows_to_update = []
+        for rid, row in self._scan_heap(tdef, txn):
+            if plan.scan.filter:
+                ctx = self._row_context(tdef, row)
+                if not self._eval_expr(plan.scan.filter, ctx, []):
+                    continue
+            rows_to_update.append((rid, row))
+
+        for rid, row in rows_to_update:
             new_vals = list(row)
             for col_name, expr in plan.assignments:
                 ci = tdef.col_index(col_name)
                 ctx = {c.name.lower(): row[i] for i, c in enumerate(tdef.columns)}
                 new_vals[ci] = self._eval_expr(expr, ctx, [])
-            record = encode_record(tdef.columns, new_vals)
-            # we need the RID — hack: re-scan to find it
-            # In production you'd carry the RID through the pipeline
+            new_record = encode_record(tdef.columns, new_vals)
+
+            # Delete old record
+            page = self._pool.fetch_page(rid.page_id)
+            page.delete(rid.slot_idx)
+            self._pool.unpin(rid.page_id, dirty=True)
+
+            # Insert new record
+            new_rid = self._heap_insert(tdef, new_record, txn)
+
+            # Update indexes: remove old key, insert new key
+            for idx in tdef.indexes.values():
+                idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
+                old_key_vals = [row[tdef.col_index(c)] for c in idx.columns]
+                old_key = encode_key(idx_cols, old_key_vals)
+                new_key_vals = [new_vals[tdef.col_index(c)] for c in idx.columns]
+                new_key = encode_key(idx_cols, new_key_vals)
+                tree = BPlusTree(self._pool, idx.root_page)
+                tree.delete(old_key, rid)
+                tree.insert(new_key, new_rid)
+                idx.root_page = tree.root_pid
             count += 1
  
         return {"columns": [], "rows": [], "message": f"{count} row(s) updated"}
@@ -434,47 +532,77 @@ class Executor:
             return
  
         tdef = self._scan_tdef(node.child)
+        # Check if child is an AggregateNode — rows are already aggregated
+        is_agg_child = isinstance(node.child, AggregateNode)
         for row in self._pull(node.child, txn):
             if any(isinstance(c, Literal) and c.value == "*" for c in node.columns):
                 yield row
             else:
-                out = []
-                for c in node.columns:
-                    if isinstance(c, FuncCall):
-                        out.append(row)  # aggregates handled by AggregateNode
-                    else:
+                if is_agg_child:
+                    # Row is [group_vals..., agg_vals...] — reorder to match SELECT list
+                    agg_node = node.child
+                    group_exprs = agg_node.group_by
+                    agg_exprs = agg_node.aggregates
+                    # Build name-based index for group-by columns
+                    group_idx = {}
+                    for gi, g in enumerate(group_exprs):
+                        if isinstance(g, ColumnRef):
+                            group_idx[g.name.lower()] = gi
+                    # Build index for aggregate positions
+                    agg_offset = len(group_exprs)
+                    out = []
+                    ai = 0
+                    for c in node.columns:
+                        if isinstance(c, FuncCall):
+                            out.append(row[agg_offset + ai])
+                            ai += 1
+                        elif isinstance(c, ColumnRef):
+                            # Match by name to the correct group-by position
+                            pos = group_idx.get(c.name.lower())
+                            if pos is not None:
+                                out.append(row[pos])
+                            else:
+                                ctx = self._row_context(tdef, row) if tdef else {}
+                                out.append(self._eval_expr(c, ctx, row))
+                        else:
+                            ctx = self._row_context(tdef, row) if tdef else {}
+                            out.append(self._eval_expr(c, ctx, row))
+                    yield out
+                else:
+                    out = []
+                    for c in node.columns:
                         ctx = self._row_context(tdef, row) if tdef else {}
                         out.append(self._eval_expr(c, ctx, row))
-                yield out
+                    yield out
  
     def _pull_sort(self, node: SortNode, txn: Transaction):
         tdef = self._scan_tdef(node.child)
         rows = list(self._pull(node.child, txn))
- 
-        # Build key function from order_by
+
         order_specs = node.order_by
- 
+
         def make_key(row):
             parts = []
             for expr, direction in order_specs:
                 ctx = self._row_context(tdef, row) if tdef else {}
                 val = self._eval_expr(expr, ctx, row)
                 if val is None:
-                    val = ""  # nulls sort first
-                parts.append(val)
+                    # NULLs sort first in ASC, last in DESC
+                    part = _NullSentinel(first=(direction != "DESC"))
+                elif direction == "DESC":
+                    part = _ReverseKey(val)
+                else:
+                    part = val
+                parts.append(part)
             return tuple(parts)
- 
-        # check if all ASC or all DESC
-        all_desc = all(d == "DESC" for _, d in order_specs)
- 
+
         if len(rows) <= 10_000:
-            # in-memory sort
-            rows.sort(key=make_key, reverse=all_desc)
+            rows.sort(key=make_key)
             yield from rows
         else:
-            sorter = ExternalMergeSorter(key_func=make_key, reverse=all_desc)
+            sorter = ExternalMergeSorter(key_func=make_key)
             yield from sorter.sort(iter(rows))
- 
+
     def _pull_limit(self, node: LimitNode, txn: Transaction):
         count = 0
         skipped = 0
@@ -505,11 +633,16 @@ class Executor:
             groups.setdefault(gkey, []).append(row)
  
         for gkey, grows in groups.items():
-            result = list(gkey) + self._compute_aggs(node.aggregates, grows, tdef)
+            agg_vals = self._compute_aggs(node.aggregates, grows, tdef)
+            result = list(gkey) + agg_vals
             if node.having:
                 ctx = self._row_context(tdef, grows[0]) if tdef else {}
-                # inject agg values — simplified
-                if not self._eval_expr(node.having, ctx, result):
+                # Inject computed aggregate values so HAVING can reference them
+                agg_ctx = {}
+                for agg_expr, agg_val in zip(node.aggregates, agg_vals):
+                    if isinstance(agg_expr, FuncCall):
+                        agg_ctx[self._agg_key(agg_expr)] = agg_val
+                if not self._eval_having(node.having, ctx, agg_ctx, result):
                     continue
             yield result
  
@@ -542,6 +675,38 @@ class Executor:
                 result.append(max(col_vals) if col_vals else None)
         return result
  
+    def _agg_key(self, func: FuncCall) -> str:
+        """Build a canonical string key for an aggregate expression."""
+        args_str = ", ".join(
+            ("*" if (isinstance(a, Literal) and a.value == "*") else
+             (a.name if isinstance(a, ColumnRef) else "?"))
+            for a in func.args
+        )
+        return f"{func.name.upper()}({args_str})"
+
+    def _eval_having(self, expr, ctx: dict, agg_ctx: dict, row: list) -> Any:
+        """Evaluate a HAVING predicate with aggregate values available."""
+        if isinstance(expr, FuncCall):
+            key = self._agg_key(expr)
+            if key in agg_ctx:
+                return agg_ctx[key]
+            return None
+        if isinstance(expr, BinaryOp):
+            left = self._eval_having(expr.left, ctx, agg_ctx, row)
+            if expr.op == "AND":
+                return bool(left) and bool(self._eval_having(expr.right, ctx, agg_ctx, row))
+            if expr.op == "OR":
+                return bool(left) or bool(self._eval_having(expr.right, ctx, agg_ctx, row))
+            right = self._eval_having(expr.right, ctx, agg_ctx, row)
+            return self._eval_binop(expr.op, left, right)
+        if isinstance(expr, UnaryOp):
+            val = self._eval_having(expr.operand, ctx, agg_ctx, row)
+            if expr.op == "NOT":
+                return not val
+            return val
+        # Fall back to regular expression evaluation for non-aggregate parts
+        return self._eval_expr(expr, ctx, row)
+
     def _extract_col_values(self, expr, rows, tdef):
         vals = []
         for row in rows:
