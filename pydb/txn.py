@@ -59,8 +59,24 @@ import enum
 import threading
 import time
  
-from pydb.wal import WAL, LogRecordType
+import struct
+
+from pydb.wal import WAL, LogRecord, LogRecordType
 from pydb.cache import BufferPool
+
+
+def _parse_update_payload(data: bytes) -> tuple[bytes, bytes]:
+    """Extract before-image and after-image from a WAL UPDATE record payload.
+
+    Payload format: [4B before_len][before][4B after_len][after]
+    """
+    blen = struct.unpack_from("<I", data, 0)[0]
+    before = data[4:4 + blen]
+    off = 4 + blen
+    alen = struct.unpack_from("<I", data, off)[0]
+    after = data[off + 4:off + 4 + alen]
+    return before, after
+
 
 class TxnState(enum.Enum):
     """Lifecycle state of a transaction.
@@ -369,12 +385,24 @@ class TransactionManager:
         are logically undone — the WAL's before-images can restore
         the original state during crash recovery if needed.
         """
+        # Undo: replay this transaction's UPDATE records in reverse
+        updates: list[LogRecord] = []
+        for rec in self._wal.iter_records():
+            if rec.txn_id == txn.txn_id and rec.rec_type == LogRecordType.UPDATE:
+                updates.append(rec)
+        for rec in reversed(updates):
+            before, _ = _parse_update_payload(rec.data)
+            page = self._pool.fetch_page(rec.page_id)
+            page._buf[:] = before
+            page._read_header()
+            self._pool.unpin(rec.page_id, dirty=True)
+
         self._wal.append(txn.txn_id, LogRecordType.ABORT)
         self._lock_mgr.release_all(txn.txn_id)
         txn.state = TxnState.ABORTED
         with self._mu:
             self._active.pop(txn.txn_id, None)
-            
+
     @property
     def auto_txn(self) -> Transaction:
         """Begin and return an implicit auto-commit transaction.

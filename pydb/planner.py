@@ -65,6 +65,7 @@ from pydb.parser import (
     CreateTableStmt, DropTableStmt, CreateIndexStmt,
     BeginStmt, CommitStmt, RollbackStmt,
     CreateUserStmt, DropUserStmt, AlterUserStmt,
+    AnalyzeStmt,
     ColumnRef, Literal, BinaryOp, FuncCall,
 )
 
@@ -221,6 +222,11 @@ class AlterUserPlan:
     username: str
     new_password: str
     
+@dataclass
+class AnalyzePlan:
+    """Physical plan for ANALYZE table_name."""
+    table: str
+
 class Planner:
     """Cost-based query planner.
  
@@ -269,6 +275,8 @@ class Planner:
             return DropUserPlan(stmt.username)
         if isinstance(stmt, AlterUserStmt):
             return AlterUserPlan(stmt.username, stmt.new_password)
+        if isinstance(stmt, AnalyzeStmt):
+            return AnalyzePlan(stmt.table)
         raise ValueError(f"Unknown statement type: {type(stmt)}")
     
     def _plan_select(self, stmt: SelectStmt):
@@ -327,37 +335,42 @@ class Planner:
         except KeyError:
             return SeqScan(table, alias, where)
         
-        # attempt to find a usable index for equality predicates
-        idx = self._find_best_index(tdef, where)
-        if idx is not None:
-            idx_def, lookup = idx
-            return IndexScan(table, idx_def.name, alias, lookup, where)
-        
-        return SeqScan(table, alias, where)
-    
-    def _find_best_index(self, tdef: TableDef, where: Any) -> Optional[tuple[IndexDef, Any]]:
-        """Look for equality predicates that match an index prefix."""
-        if where is None:
-            return None
-        eq_cols = self._extract_eq_columns(where)
-        if not eq_cols:
-            return None
-        
-        best: Optional[tuple[IndexDef, Any]] = None
-        best_score = 0
+        # Cost-based access path selection
+        stats = tdef.stats
+        seq_cost = max(stats.page_count, 1)
+        best_plan = SeqScan(table, alias, where)
+        best_cost = seq_cost
+
+        eq_cols = self._extract_eq_columns(where) if where else {}
         for idx in tdef.indexes.values():
-            # count how many leading index columns have equality predicates
             score = 0
             for ic in idx.columns:
                 if ic.lower() in eq_cols:
                     score += 1
                 else:
                     break
-            if score > best_score:
-                best_score = score
+            if score == 0:
+                continue
+
+            # Estimate selectivity from distinct-value counts
+            selectivity = 1.0
+            for ic in idx.columns[:score]:
+                ndv = stats.distinct_counts.get(ic.lower(), 0)
+                if ndv > 0:
+                    selectivity *= 1.0 / ndv
+                else:
+                    selectivity *= 0.1  # default 10% when unknown
+
+            tree_height = 3  # reasonable B+Tree depth estimate
+            est_rows = max(1, int(stats.row_count * selectivity))
+            idx_cost = tree_height + est_rows
+
+            if idx_cost < best_cost:
                 lookup = {ic.lower(): eq_cols[ic.lower()] for ic in idx.columns[:score]}
-                best = (idx, lookup)
-        return best
+                best_plan = IndexScan(table, idx.name, alias, lookup, where)
+                best_cost = idx_cost
+
+        return best_plan
     
     def _extract_eq_columns(self, expr) -> dict[str, Any]:
         """Extract col=literal equalities from a WHERE clause."""
@@ -393,7 +406,7 @@ class Planner:
                 return True
         return False
     
-def format_plan(node, indent: int = 0) -> str:
+def format_plan(node, indent: int = 0, catalog: Catalog = None) -> str:
     """Pretty-print a query plan tree as an indented string.
  
     Used by ``EXPLAIN`` to display the physical plan the planner
@@ -417,31 +430,53 @@ def format_plan(node, indent: int = 0) -> str:
     lines = []
     if isinstance(node, SeqScan):
         f = f" filter={_fmt_expr(node.filter)}" if node.filter else ""
-        lines.append(f"{prefix}SeqScan({node.table}{f})")
+        stats_info = ""
+        if catalog:
+            try:
+                tdef = catalog.get_table(node.table)
+                s = tdef.stats
+                stats_info = f" [est_rows={s.row_count}, cost={max(s.page_count, 1)}]"
+            except KeyError:
+                pass
+        lines.append(f"{prefix}SeqScan({node.table}{f}){stats_info}")
     elif isinstance(node, IndexScan):
-        lines.append(f"{prefix}IndexScan({node.table} using {node.index_name})")
+        stats_info = ""
+        if catalog:
+            try:
+                tdef = catalog.get_table(node.table)
+                s = tdef.stats
+                selectivity = 1.0
+                if node.lookup_key and isinstance(node.lookup_key, dict):
+                    for col in node.lookup_key:
+                        ndv = s.distinct_counts.get(col, 0)
+                        selectivity *= (1.0 / ndv) if ndv > 0 else 0.1
+                est_rows = max(1, int(s.row_count * selectivity))
+                stats_info = f" [est_rows={est_rows}, cost={3 + est_rows}]"
+            except KeyError:
+                pass
+        lines.append(f"{prefix}IndexScan({node.table} using {node.index_name}){stats_info}")
     elif isinstance(node, NestedLoopJoin):
         lines.append(f"{prefix}NestedLoopJoin({node.join_type})")
-        lines.append(format_plan(node.left, indent + 1))
-        lines.append(format_plan(node.right, indent + 1))
+        lines.append(format_plan(node.left, indent + 1, catalog))
+        lines.append(format_plan(node.right, indent + 1, catalog))
     elif isinstance(node, Filter):
         lines.append(f"{prefix}Filter({_fmt_expr(node.predicate)})")
-        lines.append(format_plan(node.child, indent + 1))
+        lines.append(format_plan(node.child, indent + 1, catalog))
     elif isinstance(node, Projection):
         lines.append(f"{prefix}Projection")
         if node.child:
-            lines.append(format_plan(node.child, indent + 1))
+            lines.append(format_plan(node.child, indent + 1, catalog))
     elif isinstance(node, SortNode):
         lines.append(f"{prefix}Sort")
-        lines.append(format_plan(node.child, indent + 1))
+        lines.append(format_plan(node.child, indent + 1, catalog))
     elif isinstance(node, LimitNode):
         lines.append(f"{prefix}Limit({node.limit} offset={node.offset})")
-        lines.append(format_plan(node.child, indent + 1))
+        lines.append(format_plan(node.child, indent + 1, catalog))
     elif isinstance(node, AggregateNode):
         lines.append(f"{prefix}Aggregate")
-        lines.append(format_plan(node.child, indent + 1))
+        lines.append(format_plan(node.child, indent + 1, catalog))
     elif isinstance(node, ExplainPlan):
-        lines.append(format_plan(node.child, indent))
+        lines.append(format_plan(node.child, indent, catalog))
     else:
         lines.append(f"{prefix}{type(node).__name__}")
     return "\n".join(lines)

@@ -75,7 +75,7 @@ from pydb.page import PageType, RID
 from pydb.cache import BufferPool
 from pydb.btree import BPlusTree
 from pydb.catalog import (
-    Catalog, TableDef, Column, ColType,
+    Catalog, TableDef, TableStats, Column, ColType,
     encode_record, decode_record, encode_key, parse_col_type,
 )
 from pydb.txn import TransactionManager, Transaction, LockMode
@@ -86,6 +86,7 @@ from pydb.planner import (
     CreateTablePlan, DropTablePlan, CreateIndexPlan,
     BeginPlan, CommitPlan, RollbackPlan, ExplainPlan,
     CreateUserPlan, DropUserPlan, AlterUserPlan,
+    AnalyzePlan,
     format_plan,
 )
 from pydb.parser import (
@@ -217,6 +218,9 @@ class Executor:
             self._user_store.alter_password(plan.username, plan.new_password)
             return {"columns": [], "rows": [], "message": f"Password updated for '{plan.username}'"}
 
+        if isinstance(plan, AnalyzePlan):
+            return self._exec_analyze(plan)
+
         # wrap in auto-transaction if no explicit txn
         cur = getattr(self._local, 'current_txn', None)
         auto = cur is None
@@ -233,7 +237,7 @@ class Executor:
         
     def _exec(self, plan, txn: Transaction) -> dict:
         if isinstance(plan, ExplainPlan):
-            text = format_plan(plan.child)
+            text = format_plan(plan.child, catalog=self._cat)
             return {"columns": ["plan"], "rows": [[text]], "message": "EXPLAIN"}
         
         if isinstance(plan, CreateTablePlan):
@@ -269,8 +273,13 @@ class Executor:
             
         # allocate first heap page
         first_page = self._pool.new_page()
+        before = first_page.to_bytes()
         first_page.page_type = PageType.DATA
+        after = first_page.to_bytes()
         pid = first_page.page_id
+        lsn = self._txn.log_update(txn, pid, before, after)
+        first_page.lsn = lsn
+        first_page._write_header()
         self._pool.unpin(pid, dirty=True)
         
         tdef = TableDef(stmt.table, columns, heap_page=pid)
@@ -280,7 +289,7 @@ class Executor:
         pk_cols = [c.name for c in columns if c.primary_key]
         if pk_cols:
             idx_name = f"pk_{stmt.table}"
-            tree = BPlusTree(self._pool)
+            tree = BPlusTree(self._pool, txn=txn, txn_mgr=self._txn)
             root = tree.create()
             from pydb.catalog import IndexDef
             idef = IndexDef(idx_name, stmt.table, pk_cols, root, unique=True)
@@ -313,7 +322,7 @@ class Executor:
     def _exec_create_index(self, plan: CreateIndexPlan, txn: Transaction) -> dict:
         stmt = plan.stmt
         tdef = self._cat.get_table(stmt.table)
-        tree = BPlusTree(self._pool)
+        tree = BPlusTree(self._pool, txn=txn, txn_mgr=self._txn)
         root = tree.create()
         from pydb.catalog import IndexDef
         idef = IndexDef(stmt.index_name, stmt.table, stmt.columns, root, stmt.unique)
@@ -358,14 +367,15 @@ class Executor:
                 idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
                 key_vals = [values[tdef.col_index(c)] for c in idx.columns]
                 key = encode_key(idx_cols, key_vals)
-                tree = BPlusTree(self._pool, idx.root_page)
+                tree = BPlusTree(self._pool, idx.root_page, txn, self._txn)
                 tree.insert(key, rid)
                 idx.root_page = tree.root_pid
  
             count += 1
  
+        tdef.stats.row_count += count
         return {"columns": [], "rows": [], "message": f"{count} row(s) inserted"}
-    
+
     def _exec_update(self, plan: UpdatePlan, txn: Transaction) -> dict:
         tdef = self._cat.get_table(plan.table)
         self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
@@ -390,7 +400,12 @@ class Executor:
 
             # Delete old record
             page = self._pool.fetch_page(rid.page_id)
+            before = page.to_bytes()
             page.delete(rid.slot_idx)
+            after = page.to_bytes()
+            lsn = self._txn.log_update(txn, rid.page_id, before, after)
+            page.lsn = lsn
+            page._write_header()
             self._pool.unpin(rid.page_id, dirty=True)
 
             # Insert new record
@@ -403,7 +418,7 @@ class Executor:
                 old_key = encode_key(idx_cols, old_key_vals)
                 new_key_vals = [new_vals[tdef.col_index(c)] for c in idx.columns]
                 new_key = encode_key(idx_cols, new_key_vals)
-                tree = BPlusTree(self._pool, idx.root_page)
+                tree = BPlusTree(self._pool, idx.root_page, txn, self._txn)
                 tree.delete(old_key, rid)
                 tree.insert(new_key, new_rid)
                 idx.root_page = tree.root_pid
@@ -426,20 +441,66 @@ class Executor:
  
         for rid, row in rids_to_delete:
             page = self._pool.fetch_page(rid.page_id)
+            before = page.to_bytes()
             page.delete(rid.slot_idx)
+            after = page.to_bytes()
+            lsn = self._txn.log_update(txn, rid.page_id, before, after)
+            page.lsn = lsn
+            page._write_header()
             self._pool.unpin(rid.page_id, dirty=True)
             # remove from indexes
             for idx in tdef.indexes.values():
                 idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
                 key_vals = [row[tdef.col_index(c)] for c in idx.columns]
                 key = encode_key(idx_cols, key_vals)
-                tree = BPlusTree(self._pool, idx.root_page)
+                tree = BPlusTree(self._pool, idx.root_page, txn, self._txn)
                 tree.delete(key, rid)
                 idx.root_page = tree.root_pid
             count += 1
  
+        tdef.stats.row_count -= count
         return {"columns": [], "rows": [], "message": f"{count} row(s) deleted"}
-    
+
+    def _exec_analyze(self, plan: AnalyzePlan) -> dict:
+        """Compute accurate statistics for a table by scanning the heap."""
+        tdef = self._cat.get_table(plan.table)
+        txn = self._txn.begin()
+        try:
+            row_count = 0
+            page_count = 0
+            distinct_sets: dict[str, set] = {c.name.lower(): set() for c in tdef.columns}
+
+            pid = tdef.heap_page
+            while pid != INVALID_PAGE:
+                page_count += 1
+                page = self._pool.fetch_page(pid)
+                for _, rec_bytes in page.iter_records():
+                    row = decode_record(tdef.columns, rec_bytes)
+                    row_count += 1
+                    for i, col in enumerate(tdef.columns):
+                        if row[i] is not None:
+                            distinct_sets[col.name.lower()].add(row[i])
+                next_pid = page.overflow_pid
+                self._pool.unpin(pid)
+                pid = next_pid
+
+            tdef.stats = TableStats(
+                row_count=row_count,
+                page_count=max(page_count, 1),
+                distinct_counts={k: len(v) for k, v in distinct_sets.items()},
+            )
+            self._txn.commit(txn)
+        except Exception:
+            self._txn.abort(txn)
+            raise
+
+        parts = [f"row_count={tdef.stats.row_count}",
+                 f"page_count={tdef.stats.page_count}"]
+        for col, ndv in sorted(tdef.stats.distinct_counts.items()):
+            parts.append(f"{col}.ndv={ndv}")
+        return {"columns": [], "rows": [],
+                "message": f"ANALYZE {plan.table}: {', '.join(parts)}"}
+
     def _pull(self, node, txn: Transaction) -> Iterator:
         if isinstance(node, SeqScan):
             yield from self._pull_seq_scan(node, txn)
@@ -746,8 +807,13 @@ class Executor:
         pid = tdef.heap_page
         while True:
             page = self._pool.fetch_page(pid)
+            before = page.to_bytes()
             slot = page.insert(record)
             if slot is not None:
+                after = page.to_bytes()
+                lsn = self._txn.log_update(txn, pid, before, after)
+                page.lsn = lsn
+                page._write_header()
                 self._pool.unpin(pid, dirty=True)
                 return RID(pid, slot)
             next_pid = page.overflow_pid
@@ -755,11 +821,21 @@ class Executor:
                 # allocate new page and chain it
                 new_page = self._pool.new_page()
                 new_page.page_type = PageType.DATA
+                tdef.stats.page_count += 1
                 page.overflow_pid = new_page.page_id
                 page._write_header()
+                after_old = page.to_bytes()
+                lsn = self._txn.log_update(txn, pid, before, after_old)
+                page.lsn = lsn
+                page._write_header()
                 self._pool.unpin(pid, dirty=True)
+                before_new = new_page.to_bytes()
                 slot = new_page.insert(record)
+                after_new = new_page.to_bytes()
                 npid = new_page.page_id
+                lsn = self._txn.log_update(txn, npid, before_new, after_new)
+                new_page.lsn = lsn
+                new_page._write_header()
                 self._pool.unpin(npid, dirty=True)
                 return RID(npid, slot)
             self._pool.unpin(pid)

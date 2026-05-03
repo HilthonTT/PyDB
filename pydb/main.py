@@ -7,4 +7,3 @@ and starts either the interactive REPL or the TCP-only server.
 from pydb.repl import main
 
 main()
- 

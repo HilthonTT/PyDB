@@ -116,10 +116,12 @@ class BufferPool:
         pool.unpin(page.page_id, dirty=True)
     """
     
-    def __init__(self, disk: DiskManager, capacity: int = BUFFER_POOL_CAP, k: int = LRU_K):
+    def __init__(self, disk: DiskManager, capacity: int = BUFFER_POOL_CAP, k: int = LRU_K,
+                 wal=None):
         self._disk = disk
         self._cap  = capacity
         self._k    = k
+        self._wal  = wal
         self._lock = threading.Lock()
         self._frames: dict[int, _Frame] = {}  # page_id -> frame
         
@@ -380,5 +382,7 @@ class BufferPool:
             raise RuntimeError("Buffer pool full: all pages are pinned")
  
         if victim.dirty:
+            if self._wal:
+                self._wal.flush()
             self._disk.write_page(victim.page_id, victim.page.to_bytes())
         del self._frames[victim.page_id]

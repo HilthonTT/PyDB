@@ -56,15 +56,15 @@ Usage
 
 from __future__ import annotations
  
-import os
 from pathlib import Path
  
 from pydb import BUFFER_POOL_CAP
 from pydb.storage import DiskManager
 from pydb.cache import BufferPool
-from pydb.wal import WAL
-from pydb.txn import TransactionManager
+from pydb.wal import WAL, LogRecordType
+from pydb.txn import TransactionManager, _parse_update_payload
 from pydb.catalog import Catalog
+from pydb.page import SlottedPage
 from pydb.parser import parse_sql, ParseError
 from pydb.planner import Planner
 from pydb.executor import Executor, ExecutionError
@@ -92,8 +92,9 @@ class Database:
         self._dir.mkdir(parents=True, exist_ok=True)
         
         self._disk = DiskManager(self._dir / "data.db")
-        self._pool = BufferPool(self._disk, capacity=buffer_pool_size)
         self._wal = WAL(self._dir / "wal.log")
+        self._recover()
+        self._pool = BufferPool(self._disk, capacity=buffer_pool_size, wal=self._wal)
         self._txn = TransactionManager(self._wal, self._pool)
         
         cat_path = self._dir / "catalog.json"
@@ -154,6 +155,61 @@ class Database:
         except Exception as e:
             return {"columns": [], "rows": [], "message": f"Error: {e}"}
         
+    def _recover(self):
+        """Replay the WAL to recover from a crash.
+
+        Three passes:
+        1. Analysis — scan all records to classify transactions.
+        2. Redo — re-apply after-images for committed transactions
+           whose pages are stale (record LSN > page LSN).
+        3. Undo — restore before-images for uncommitted transactions.
+
+        After recovery, flush all pages and truncate the WAL.
+        """
+        records = list(self._wal.iter_records())
+        if not records:
+            return
+
+        # Analysis: classify transactions
+        committed = set()
+        aborted = set()
+        updates: dict[int, list] = {}  # txn_id -> [records]
+        for rec in records:
+            if rec.rec_type == LogRecordType.COMMIT:
+                committed.add(rec.txn_id)
+            elif rec.rec_type == LogRecordType.ABORT:
+                aborted.add(rec.txn_id)
+            elif rec.rec_type == LogRecordType.UPDATE:
+                updates.setdefault(rec.txn_id, []).append(rec)
+
+        dirty = False
+
+        # Redo: apply after-images for committed txns in LSN order
+        for rec in records:
+            if rec.rec_type == LogRecordType.UPDATE and rec.txn_id in committed:
+                _, after = _parse_update_payload(rec.data)
+                raw = self._disk.read_page(rec.page_id)
+                page = SlottedPage.from_bytes(raw)
+                if rec.lsn > page.lsn:
+                    self._disk.write_page(rec.page_id, after)
+                    dirty = True
+
+        # Undo: restore before-images for uncommitted transactions
+        # Process in reverse LSN order for correct undo sequencing
+        uncommitted_updates = []
+        for rec in records:
+            if rec.rec_type == LogRecordType.UPDATE:
+                if rec.txn_id not in committed and rec.txn_id not in aborted:
+                    uncommitted_updates.append(rec)
+        for rec in reversed(uncommitted_updates):
+            before, _ = _parse_update_payload(rec.data)
+            self._disk.write_page(rec.page_id, before)
+            dirty = True
+
+        if dirty:
+            self._disk.flush()
+        self._wal.truncate()
+
     def close(self):
         """Flush all state to disk and close file handles.
 
@@ -161,11 +217,12 @@ class Database:
 
         1. Flush every dirty page from the buffer pool to ``data.db``.
         2. Serialise the catalog to ``catalog.json``.
-        3. Close the WAL file handle.
-        4. Close the data file handle.
+        3. Truncate the WAL (all pages are durable).
+        4. Close the WAL and data file handles.
         """
         self._pool.flush_all()
         cat_path = self._dir / "catalog.json"
         cat_path.write_text(self._catalog.to_json())
+        self._wal.truncate()
         self._wal.close()
         self._disk.close()

@@ -40,8 +40,9 @@ Slotted Pages (page.py) ------- variable-length records in 4096-byte pages
 - **Storage**: slotted-page heap files with overflow chains
 - **Indexes**: B+Tree with split, merge, and redistribute balancing
 - **Caching**: LRU-K(2) buffer pool with dirty-page tracking
-- **Transactions**: STEAL/NO-FORCE WAL, strict two-phase locking
-- **SQL**: recursive-descent parser supporting SELECT, INSERT, UPDATE, DELETE, JOINs, GROUP BY, ORDER BY, LIMIT
+- **Transactions**: STEAL/NO-FORCE WAL with full-page before/after images, strict two-phase locking, crash recovery (redo/undo) on startup
+- **SQL**: recursive-descent parser supporting SELECT, INSERT, UPDATE, DELETE, JOINs, GROUP BY, ORDER BY, LIMIT, ANALYZE
+- **Query planning**: cost-based index selection using table statistics (row counts, distinct-value counts, selectivity estimates)
 - **Authentication**: username/password auth with PBKDF2-HMAC-SHA256, user management via SQL
 - **Networking**: length-prefixed TCP wire protocol with auth handshake
 - **Sorting**: k-way external merge sort for large result sets
@@ -235,6 +236,20 @@ COMMIT;
 ROLLBACK;
 ```
 
+### Table Statistics
+
+```sql
+-- Compute accurate statistics for cost-based planning
+ANALYZE users;
+-- ANALYZE users: row_count=1000, page_count=12, id.ndv=1000, name.ndv=950
+
+-- View query plan with cost estimates (requires ANALYZE first)
+EXPLAIN SELECT * FROM users WHERE id = 1;
+-- IndexScan(users using pk_users) [est_rows=1, cost=4]
+```
+
+After running `ANALYZE`, the planner uses per-column distinct-value counts to estimate selectivity and choose between sequential scans and index scans based on I/O cost.
+
 ### Other
 
 ```sql
@@ -295,12 +310,12 @@ pydb/
   storage.py     -- disk manager (page I/O, free-list allocation)
   cache.py       -- LRU-K(2) buffer pool with pin counting
   btree.py       -- B+Tree indexes (insert, delete, range scan)
-  wal.py         -- write-ahead log (append, recover, iterate)
-  txn.py         -- transaction manager (strict 2PL, WAL integration)
-  catalog.py     -- table/index definitions, record encoding/decoding
+  wal.py         -- write-ahead log (append, recover, iterate, truncate)
+  txn.py         -- transaction manager (strict 2PL, WAL logging, undo on abort)
+  catalog.py     -- table/index definitions, record encoding, table statistics
   auth.py        -- user authentication (PBKDF2 hashing, user store)
   parser.py      -- recursive-descent SQL parser
-  planner.py     -- query planner with index selection
+  planner.py     -- cost-based query planner with index selection
   executor.py    -- Volcano-style pull executor
   sorter.py      -- k-way external merge sort
   engine.py      -- Database facade (wires all components together)
@@ -312,10 +327,13 @@ pydb/
 
 ## Design Decisions
 
-- **STEAL/NO-FORCE WAL**: dirty pages can be flushed before commit; pages are not forced at commit time. Recovery replays the WAL.
+- **STEAL/NO-FORCE WAL**: dirty pages can be flushed before commit; pages are not forced at commit time. Every page mutation (heap and B+Tree) logs full-page before/after images to the WAL. On crash, recovery redoes committed transactions and undoes uncommitted ones. The WAL is truncated on clean shutdown.
+- **WAL-aware buffer pool**: the buffer pool flushes the WAL before evicting dirty pages, ensuring the write-ahead invariant holds even under memory pressure.
+- **Undo on abort**: when a transaction rolls back, all its page modifications are reversed by replaying WAL UPDATE records in reverse order, restoring before-images.
 - **Slotted pages**: slot directory grows forward, record payloads grow backward. Deletion tombstones slots; `compact()` reclaims space.
 - **Record encoding**: null bitmap + fixed-width fields (INTEGER=8B, FLOAT=8B, BOOLEAN=1B) + length-prefixed TEXT.
 - **Key encoding**: big-endian with sign-bit flips for correct lexicographic sort order.
 - **Strict 2PL**: all locks held until commit/abort. Timeout-based deadlock prevention (5s).
-- **Catalog**: persisted as `catalog.json`, not in the data file.
+- **Cost-based planning**: the planner estimates I/O cost for sequential scans (`page_count`) vs index scans (`tree_height + selectivity * row_count`). Selectivity is derived from per-column distinct-value counts computed by `ANALYZE`. Without statistics, a default selectivity of 10% per predicate is assumed.
+- **Catalog**: persisted as `catalog.json` (including table statistics), not in the data file.
 - **Authentication**: passwords hashed with PBKDF2-HMAC-SHA256 (100k iterations, 16-byte salt). Users stored in `users.json`. TCP connections require auth; REPL sessions bypass it.

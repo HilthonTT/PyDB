@@ -89,6 +89,7 @@ from typing import Optional
 from pydb import INVALID_PAGE, BTREE_ORDER, PAGE_SIZE, HEADER_SIZE
 from pydb.page import SlottedPage, PageType, RID
 from pydb.cache import BufferPool
+from pydb.txn import Transaction, TransactionManager
 
 ORDER = BTREE_ORDER
 """Maximum keys per B+Tree node.  A node splits when it exceeds this."""
@@ -233,9 +234,21 @@ class BPlusTree:
         responsible for persisting the new value in the catalog.
     """
 
-    def __init__(self, pool: BufferPool, root_page_id: int = INVALID_PAGE):
+    def __init__(self, pool: BufferPool, root_page_id: int = INVALID_PAGE,
+                 txn: Optional[Transaction] = None, 
+                 txn_mgr: Optional[TransactionManager] = None):
         self._pool = pool
         self.root_pid = root_page_id
+        self._txn = txn
+        self._txn_mgr = txn_mgr
+
+    def _log_mutation(self, page: SlottedPage, before: bytes):
+        """Log a page mutation to the WAL if a transaction context is available."""
+        if self._txn and self._txn_mgr:
+            after = page.to_bytes()
+            lsn = self._txn_mgr.log_update(self._txn, page.page_id, before, after)
+            page.lsn = lsn
+            page._write_header()
 
     def _alloc_node(self, ptype: PageType) -> SlottedPage:
         """Allocate a fresh page from the buffer pool and set its type."""
@@ -258,11 +271,13 @@ class BPlusTree:
         new blob.  This is safe because B+Tree nodes always occupy
         exactly one slot per page.
         """
+        before = page.to_bytes()
         page.num_slots = 0
         page.free_offset = HEADER_SIZE
         page.free_end = PAGE_SIZE
         page._write_header()
         page.insert(data)
+        self._log_mutation(page, before)
 
     def _read_node(self, page: SlottedPage) -> bytes:
         """Read the serialised node blob from slot 0 of *page*."""

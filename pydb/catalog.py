@@ -87,7 +87,6 @@ from enum import Enum, auto
 from typing import Any
  
 from pydb import INVALID_PAGE
- 
 
 class ColType(Enum):
     """Enumeration of supported column data types.
@@ -177,7 +176,14 @@ class IndexDef:
     columns: list[str]
     root_page: int = INVALID_PAGE
     unique: bool = False
-    
+
+@dataclass
+class TableStats:
+    """Table-level statistics used by the cost-based planner."""
+    row_count: int = 0
+    page_count: int = 1
+    distinct_counts: dict[str, int] = field(default_factory=dict)
+
 @dataclass
 class TableDef:
     """Definition of a table (schema + physical metadata).
@@ -201,7 +207,8 @@ class TableDef:
     heap_page: int = INVALID_PAGE
     next_rowid: int = 1
     indexes: dict[str, "IndexDef"] = field(default_factory=dict)
-    
+    stats: "TableStats" = field(default_factory=lambda: TableStats())
+
     @property
     def col_names(self) -> list[str]:
         """Return column names in declaration order."""
@@ -311,6 +318,11 @@ class Catalog:
                 ],
                 "heap_page": t.heap_page,
                 "next_rowid": t.next_rowid,
+                "stats": {
+                    "row_count": t.stats.row_count,
+                    "page_count": t.stats.page_count,
+                    "distinct_counts": t.stats.distinct_counts,
+                },
             }
         for k, ix in self.indexes.items():
             d["indexes"][k] = {
@@ -334,7 +346,14 @@ class Catalog:
         for k, td in d.get("tables", {}).items():
             cols = [Column(c["name"], ColType[c["type"]], c["nullable"], c["primary_key"])
                     for c in td["columns"]]
-            tdef = TableDef(td["name"], cols, td["heap_page"], td["next_rowid"])
+            stats_d = td.get("stats", {})
+            stats = TableStats(
+                row_count=stats_d.get("row_count", 0),
+                page_count=stats_d.get("page_count", 1),
+                distinct_counts=stats_d.get("distinct_counts", {}),
+            )
+            tdef = TableDef(td["name"], cols, td["heap_page"], td["next_rowid"],
+                            stats=stats)
             cat.tables[k] = tdef
         for k, ix in d.get("indexes", {}).items():
             idef = IndexDef(ix["name"], ix["table_name"], ix["columns"],

@@ -113,6 +113,7 @@ class TT(Enum):
     MAX      = auto(); DISTINCT = auto(); OFFSET   = auto()
     USER     = auto(); PASSWORD = auto(); ALTER    = auto()
     IDENTIFIED = auto()
+    ANALYZE  = auto()
     # symbols
     LPAREN = auto(); RPAREN = auto(); COMMA   = auto()
     DOT    = auto(); SEMI   = auto(); STAR    = auto()
@@ -122,7 +123,7 @@ class TT(Enum):
     # meta
     EOF    = auto()
 
-_KEYWORDS = {k.name: k for k in TT if k.value >= TT.SELECT.value and k.value <= TT.IDENTIFIED.value}
+_KEYWORDS = {k.name: k for k in TT if k.value >= TT.SELECT.value and k.value <= TT.ANALYZE.value}
 
 @dataclass
 class Token:
@@ -399,6 +400,11 @@ class AlterUserStmt:
     username: str
     new_password: str
 
+@dataclass
+class AnalyzeStmt:
+    """Parsed ``ANALYZE table_name`` statement."""
+    table: str
+
 class ParseError(Exception):
     pass
 
@@ -473,6 +479,10 @@ class Parser:
             self._advance(); return RollbackStmt()
         if t.tt == TT.ALTER:
             return self._alter_user()
+        if t.tt == TT.ANALYZE:
+            self._advance()
+            table = self._expect(TT.IDENT).value
+            return AnalyzeStmt(table)
         raise ParseError(f"Unexpected token {t.tt.name} at pos {t.pos}")
 
     # ── SELECT ────────────────────────────────────────────────────
