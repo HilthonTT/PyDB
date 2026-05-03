@@ -67,8 +67,8 @@ except ImportError:
 
 BANNER = r"""
   ╔═══════════════════════════════════════════╗
-  ║   PyDB v1.0 — A Database from Scratch    ║
-  ║   B+Tree · WAL · LRU-K · SQL · TCP       ║
+  ║   PyDB v1.0 — A Database from Scratch     ║
+  ║   B+Tree · WAL · LRU-K · SQL · TCP        ║
   ╠═══════════════════════════════════════════╣
   ║  Type .help for commands, SQL to query.   ║
   ║  Press Ctrl+D or type .quit to exit.      ║
@@ -235,7 +235,8 @@ Special commands:
             if self._server:
                 print("Server already running")
                 return
-            self._server = TCPServer(self._db, port=port)
+            self._server = TCPServer(self._db, port=port,
+                                     user_store=self._db.user_store)
             t = threading.Thread(target=self._server.start, daemon=True)
             t.start()
             print(f"TCP server started on port {port}")
@@ -261,7 +262,7 @@ def main():
  
     if args.server:
         db = Database(args.data)
-        srv = TCPServer(db, port=args.port)
+        srv = TCPServer(db, port=args.port, user_store=db.user_store)
         print(f"Starting PyDB TCP server on port {args.port}...")
         try:
             srv.start()

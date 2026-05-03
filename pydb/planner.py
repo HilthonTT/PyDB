@@ -56,16 +56,16 @@ string for ``EXPLAIN`` output.
 
 from __future__ import annotations
  
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
-from pydb.catalog import Catalog, TableDef, IndexDef, ColType
+from pydb.catalog import Catalog, TableDef, IndexDef
 from pydb.parser import (
     SelectStmt, InsertStmt, UpdateStmt, DeleteStmt,
     CreateTableStmt, DropTableStmt, CreateIndexStmt,
     BeginStmt, CommitStmt, RollbackStmt,
-    ColumnRef, Literal, BinaryOp, UnaryOp, FuncCall,
-    IsNullExpr, InExpr, BetweenExpr,
+    CreateUserStmt, DropUserStmt, AlterUserStmt,
+    ColumnRef, Literal, BinaryOp, FuncCall,
 )
 
 @dataclass
@@ -203,6 +203,23 @@ class RollbackPlan:
 class ExplainPlan:
     """Wraps another plan — executor prints the plan tree instead of running it."""
     child: Any
+
+@dataclass
+class CreateUserPlan:
+    """Physical plan for CREATE USER."""
+    username: str
+    password: str
+
+@dataclass
+class DropUserPlan:
+    """Physical plan for DROP USER."""
+    username: str
+
+@dataclass
+class AlterUserPlan:
+    """Physical plan for ALTER USER ... SET PASSWORD."""
+    username: str
+    new_password: str
     
 class Planner:
     """Cost-based query planner.
@@ -246,6 +263,12 @@ class Planner:
             return CommitPlan()
         if isinstance(stmt, RollbackStmt):
             return RollbackPlan()
+        if isinstance(stmt, CreateUserStmt):
+            return CreateUserPlan(stmt.username, stmt.password)
+        if isinstance(stmt, DropUserStmt):
+            return DropUserPlan(stmt.username)
+        if isinstance(stmt, AlterUserStmt):
+            return AlterUserPlan(stmt.username, stmt.new_password)
         raise ValueError(f"Unknown statement type: {type(stmt)}")
     
     def _plan_select(self, stmt: SelectStmt):

@@ -73,9 +73,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Optional, Union
-
-# ── Tokens ────────────────────────────────────────────────────────
+from typing import Any, Optional
 
 class TT(Enum):
     """Token type enumeration.
@@ -113,6 +111,8 @@ class TT(Enum):
     GROUP    = auto(); HAVING   = auto(); COUNT    = auto()
     SUM      = auto(); AVG      = auto(); MIN      = auto()
     MAX      = auto(); DISTINCT = auto(); OFFSET   = auto()
+    USER     = auto(); PASSWORD = auto(); ALTER    = auto()
+    IDENTIFIED = auto()
     # symbols
     LPAREN = auto(); RPAREN = auto(); COMMA   = auto()
     DOT    = auto(); SEMI   = auto(); STAR    = auto()
@@ -122,7 +122,7 @@ class TT(Enum):
     # meta
     EOF    = auto()
 
-_KEYWORDS = {k.name: k for k in TT if k.value >= TT.SELECT.value and k.value <= TT.OFFSET.value}
+_KEYWORDS = {k.name: k for k in TT if k.value >= TT.SELECT.value and k.value <= TT.IDENTIFIED.value}
 
 @dataclass
 class Token:
@@ -222,8 +222,6 @@ def tokenize(sql: str) -> list[Token]:
 
     tokens.append(Token(TT.EOF, None, len(sql)))
     return tokens
-
-# ── AST nodes ─────────────────────────────────────────────────────
 
 @dataclass
 class ColumnRef:
@@ -384,6 +382,23 @@ class RollbackStmt:
     """Parsed ``ROLLBACK`` statement."""
     pass
 
+@dataclass
+class CreateUserStmt:
+    """Parsed ``CREATE USER name IDENTIFIED BY 'password'`` statement."""
+    username: str
+    password: str
+
+@dataclass
+class DropUserStmt:
+    """Parsed ``DROP USER name`` statement."""
+    username: str
+
+@dataclass
+class AlterUserStmt:
+    """Parsed ``ALTER USER name SET PASSWORD 'password'`` statement."""
+    username: str
+    new_password: str
+
 class ParseError(Exception):
     pass
 
@@ -456,6 +471,8 @@ class Parser:
             self._advance(); return CommitStmt()
         if t.tt == TT.ROLLBACK:
             self._advance(); return RollbackStmt()
+        if t.tt == TT.ALTER:
+            return self._alter_user()
         raise ParseError(f"Unexpected token {t.tt.name} at pos {t.pos}")
 
     # ── SELECT ────────────────────────────────────────────────────
@@ -753,6 +770,8 @@ class Parser:
         self._expect(TT.CREATE)
         if self._match(TT.TABLE):
             return self._create_table()
+        if self._match(TT.USER):
+            return self._create_user()
         unique = bool(self._match(TT.UNIQUE))
         self._expect(TT.INDEX)
         return self._create_index(unique)
@@ -792,9 +811,28 @@ class Parser:
         self._expect(TT.RPAREN)
         return CreateIndexStmt(idx_name, table, cols, unique)
 
+    def _create_user(self):
+        name = self._expect(TT.IDENT).value
+        self._expect(TT.IDENTIFIED)
+        self._expect(TT.BY)
+        password = self._expect(TT.STRING).value
+        return CreateUserStmt(name, password)
+
+    def _alter_user(self):
+        self._expect(TT.ALTER)
+        self._expect(TT.USER)
+        name = self._expect(TT.IDENT).value
+        self._expect(TT.SET)
+        self._expect(TT.PASSWORD)
+        new_password = self._expect(TT.STRING).value
+        return AlterUserStmt(name, new_password)
+
     # ── DROP ──────────────────────────────────────────────────────
     def _drop(self):
         self._expect(TT.DROP)
+        if self._match(TT.USER):
+            name = self._expect(TT.IDENT).value
+            return DropUserStmt(name)
         self._expect(TT.TABLE)
         name = self._expect(TT.IDENT).value
         return DropTableStmt(name)

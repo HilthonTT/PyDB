@@ -30,3 +30,5 @@ LRU_K           = 2                 # history depth for LRU-K
 BUFFER_POOL_CAP = 1024              # default # of frames
 SORT_MEM_PAGES  = 64                # pages of RAM for external sort runs
 WIRE_MAX_MSG    = 16 * 1024 * 1024  # 16 MiB max network message
+AUTH_PBKDF2_ITERATIONS = 100_000    # PBKDF2 iteration count
+AUTH_SALT_BYTES = 16                # salt length in bytes

@@ -52,7 +52,7 @@ import os
 import pickle
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Callable, Iterator
  
 def _default_key(row):
     """Identity key function — sort by the row itself."""

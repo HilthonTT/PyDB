@@ -85,6 +85,7 @@ from pydb.planner import (
     InsertPlan, UpdatePlan, DeletePlan,
     CreateTablePlan, DropTablePlan, CreateIndexPlan,
     BeginPlan, CommitPlan, RollbackPlan, ExplainPlan,
+    CreateUserPlan, DropUserPlan, AlterUserPlan,
     format_plan,
 )
 from pydb.parser import (
@@ -92,8 +93,7 @@ from pydb.parser import (
     IsNullExpr, InExpr, BetweenExpr,
 )
 from pydb.sorter import ExternalMergeSorter
- 
- 
+
 class _NullSentinel:
     """Sentinel for NULL values in sort keys. Sorts before/after all real values."""
     __slots__ = ("_first",)
@@ -160,10 +160,12 @@ class Executor:
         The transaction manager for locking and WAL logging.
     """
     
-    def __init__(self, catalog: Catalog, pool: BufferPool, txn_mgr: TransactionManager):
+    def __init__(self, catalog: Catalog, pool: BufferPool, txn_mgr: TransactionManager,
+                 user_store=None):
         self._cat = catalog
         self._pool = pool
         self._txn = txn_mgr
+        self._user_store = user_store
         self._local = threading.local()
         
     def execute(self, plan) -> dict:
@@ -202,6 +204,18 @@ class Executor:
                 self._txn.abort(cur)
                 self._local.current_txn = None
             return {"columns": [], "rows": [], "message": "ROLLBACK"}
+
+        if isinstance(plan, CreateUserPlan):
+            self._user_store.create_user(plan.username, plan.password)
+            return {"columns": [], "rows": [], "message": f"User '{plan.username}' created"}
+
+        if isinstance(plan, DropUserPlan):
+            self._user_store.drop_user(plan.username)
+            return {"columns": [], "rows": [], "message": f"User '{plan.username}' dropped"}
+
+        if isinstance(plan, AlterUserPlan):
+            self._user_store.alter_password(plan.username, plan.new_password)
+            return {"columns": [], "rows": [], "message": f"Password updated for '{plan.username}'"}
 
         # wrap in auto-transaction if no explicit txn
         cur = getattr(self._local, 'current_txn', None)

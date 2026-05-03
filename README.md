@@ -42,7 +42,8 @@ Slotted Pages (page.py) ------- variable-length records in 4096-byte pages
 - **Caching**: LRU-K(2) buffer pool with dirty-page tracking
 - **Transactions**: STEAL/NO-FORCE WAL, strict two-phase locking
 - **SQL**: recursive-descent parser supporting SELECT, INSERT, UPDATE, DELETE, JOINs, GROUP BY, ORDER BY, LIMIT
-- **Networking**: length-prefixed TCP wire protocol
+- **Authentication**: username/password auth with PBKDF2-HMAC-SHA256, user management via SQL
+- **Networking**: length-prefixed TCP wire protocol with auth handshake
 - **Sorting**: k-way external merge sort for large result sets
 - **REPL**: interactive shell with readline support and ASCII table output
 
@@ -101,14 +102,20 @@ Start a standalone server:
 python -m pydb.main --data mydb --server --port 5433
 ```
 
+On first startup, a default user `admin` with password `admin` is created. Change this immediately:
+
+```sql
+ALTER USER admin SET PASSWORD 'your_secure_password';
+```
+
 ### Client Library
 
-Connect from application code:
+Connect from application code (credentials required for TCP connections):
 
 ```python
 from pydb.client import Client
 
-with Client("127.0.0.1", 5433) as db:
+with Client("127.0.0.1", 5433, username="admin", password="admin") as db:
     db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)")
     db.execute("INSERT INTO products (name, price) VALUES ('Widget', 9.99)")
 
@@ -124,7 +131,8 @@ For web servers and concurrent applications:
 ```python
 from pydb.client import ConnectionPool
 
-pool = ConnectionPool("127.0.0.1", 5433, min_size=2, max_size=10)
+pool = ConnectionPool("127.0.0.1", 5433, min_size=2, max_size=10,
+                      username="admin", password="admin")
 
 # Thread-safe: each `connection()` call gets its own client
 with pool.connection() as db:
@@ -142,7 +150,8 @@ from flask import Flask, request, jsonify
 from pydb.client import ConnectionPool
 
 app = Flask(__name__)
-pool = ConnectionPool("127.0.0.1", 5433, min_size=2, max_size=10)
+pool = ConnectionPool("127.0.0.1", 5433, min_size=2, max_size=10,
+                      username="admin", password="admin")
 
 @app.route("/query", methods=["POST"])
 def query():
@@ -206,6 +215,16 @@ SELECT * FROM users WHERE age IN (25, 30, 35);
 SELECT * FROM users WHERE email IS NOT NULL;
 ```
 
+### User Management
+
+```sql
+CREATE USER username IDENTIFIED BY 'password';
+
+ALTER USER username SET PASSWORD 'new_password';
+
+DROP USER username;
+```
+
 ### Transaction Control
 
 ```sql
@@ -224,7 +243,25 @@ EXPLAIN SELECT * FROM users WHERE id = 1;
 
 ## Wire Protocol
 
-The TCP protocol uses length-prefixed messages (little-endian):
+The TCP protocol uses length-prefixed messages (little-endian `u32` header):
+
+### Authentication Handshake
+
+The first message after connecting must be an auth request:
+
+```
+Client -> Server:
+  [len][JSON: {"auth": {"username": "admin", "password": "secret"}}]
+
+Server -> Client:
+  [len][JSON: {"ok": true, "message": "Authenticated as 'admin'"}]
+  -- or on failure --
+  [len][JSON: {"ok": false, "message": "Authentication failed"}]
+```
+
+On failure the server closes the connection. On success, the SQL loop begins.
+
+### SQL Messages
 
 ```
 Client -> Server:
@@ -261,6 +298,7 @@ pydb/
   wal.py         -- write-ahead log (append, recover, iterate)
   txn.py         -- transaction manager (strict 2PL, WAL integration)
   catalog.py     -- table/index definitions, record encoding/decoding
+  auth.py        -- user authentication (PBKDF2 hashing, user store)
   parser.py      -- recursive-descent SQL parser
   planner.py     -- query planner with index selection
   executor.py    -- Volcano-style pull executor
@@ -280,3 +318,4 @@ pydb/
 - **Key encoding**: big-endian with sign-bit flips for correct lexicographic sort order.
 - **Strict 2PL**: all locks held until commit/abort. Timeout-based deadlock prevention (5s).
 - **Catalog**: persisted as `catalog.json`, not in the data file.
+- **Authentication**: passwords hashed with PBKDF2-HMAC-SHA256 (100k iterations, 16-byte salt). Users stored in `users.json`. TCP connections require auth; REPL sessions bypass it.

@@ -109,19 +109,32 @@ class Client:
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 5433,
-                 timeout: Optional[float] = None):
+                 timeout: Optional[float] = None,
+                 username: Optional[str] = None, password: Optional[str] = None):
         self._host = host
         self._port = port
         self._timeout = timeout
+        self._username = username
+        self._password = password
         self._sock: Optional[socket.socket] = None
         self._connect()
 
     def _connect(self):
-        """Establish the TCP connection."""
+        """Establish the TCP connection and authenticate if credentials were provided."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         if self._timeout is not None:
             self._sock.settimeout(self._timeout)
         self._sock.connect((self._host, self._port))
+        if self._username is not None:
+            auth_msg = json.dumps({"auth": {"username": self._username,
+                                            "password": self._password or ""}})
+            _send_message(self._sock, auth_msg)
+            resp = json.loads(_read_message(self._sock))
+            if not resp.get("ok"):
+                self._sock.close()
+                self._sock = None
+                raise ConnectionError(
+                    f"Authentication failed: {resp.get('message', '')}")
 
     def execute(self, sql: str) -> dict:
         """Send a SQL statement and return the parsed JSON result.
@@ -215,10 +228,13 @@ class ConnectionPool:
 
     def __init__(self, host: str = "127.0.0.1", port: int = 5433,
                  min_size: int = 2, max_size: int = 10,
-                 timeout: Optional[float] = None):
+                 timeout: Optional[float] = None,
+                 username: Optional[str] = None, password: Optional[str] = None):
         self._host = host
         self._port = port
         self._timeout = timeout
+        self._username = username
+        self._password = password
         self._max_size = max(min_size, max_size)
         self._pool: queue.Queue[Client] = queue.Queue(maxsize=self._max_size)
         self._size = 0
@@ -233,7 +249,8 @@ class ConnectionPool:
         """Create a new connection and track pool size."""
         with self._lock:
             self._size += 1
-        return Client(self._host, self._port, self._timeout)
+        return Client(self._host, self._port, self._timeout,
+                      self._username, self._password)
 
     def acquire(self) -> Client:
         """Get a connection from the pool (blocking if needed).

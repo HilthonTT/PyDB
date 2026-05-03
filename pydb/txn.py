@@ -58,7 +58,6 @@ from __future__ import annotations
 import enum
 import threading
 import time
-from typing import Optional
  
 from pydb.wal import WAL, LogRecordType
 from pydb.cache import BufferPool

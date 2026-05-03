@@ -68,6 +68,7 @@ from pydb.catalog import Catalog
 from pydb.parser import parse_sql, ParseError
 from pydb.planner import Planner
 from pydb.executor import Executor, ExecutionError
+from pydb.auth import UserStore
 
 class Database:
     """Self-contained database engine.
@@ -101,9 +102,17 @@ class Database:
         else:
             self._catalog = Catalog()
         
+        self._user_store = UserStore(self._dir / "users.json")
+        self._user_store.ensure_default_admin()
+
         self._planner = Planner(self._catalog)
-        self._executor = Executor(self._catalog, self._pool, self._txn)
+        self._executor = Executor(self._catalog, self._pool, self._txn, self._user_store)
         
+    @property
+    def user_store(self):
+        """The authentication user store."""
+        return self._user_store
+
     def execute(self, sql: str) -> dict:
         """Parse, plan, and execute a single SQL statement.
  

@@ -68,7 +68,6 @@ import json
 import socket
 import struct
 import threading
-import time
 from typing import Optional
  
 from pydb import WIRE_MAX_MSG
@@ -117,15 +116,45 @@ class ClientHandler(threading.Thread):
     on disconnect or when the client sends ``".quit"``.
     """
     
-    def __init__(self, sock: socket.socket, addr, db: Database):
+    def __init__(self, sock: socket.socket, addr, db: Database, user_store=None):
         super().__init__(daemon=True)
         self._sock = sock
         self._addr = addr
         self._db = db
+        self._user_store = user_store
         
+    def _authenticate(self) -> bool:
+        """Perform the auth handshake.  Returns True on success."""
+        try:
+            msg = _read_message(self._sock)
+        except ConnectionError:
+            return False
+        try:
+            req = json.loads(msg)
+            creds = req.get("auth", {})
+            username = creds.get("username", "")
+            password = creds.get("password", "")
+        except (json.JSONDecodeError, AttributeError):
+            _send_message(self._sock, json.dumps(
+                {"ok": False, "message": "Expected auth message"}))
+            return False
+
+        if self._user_store.authenticate(username, password):
+            _send_message(self._sock, json.dumps(
+                {"ok": True, "message": f"Authenticated as '{username}'"}))
+            return True
+        else:
+            _send_message(self._sock, json.dumps(
+                {"ok": False, "message": "Authentication failed"}))
+            return False
+
     def run(self):
         print(f"[server] Client connected: {self._addr}")
         try:
+            if self._user_store is not None:
+                if not self._authenticate():
+                    return
+
             while True:
                 try:
                     sql = _read_message(self._sock)
@@ -169,10 +198,12 @@ class TCPServer:
         default, to avoid conflicts).
     """
     
-    def __init__(self, db: Database, host: str = "0.0.0.0", port: int = 5433):
+    def __init__(self, db: Database, host: str = "0.0.0.0", port: int = 5433,
+                 user_store=None):
         self._db = db
         self._host = host
         self._port = port
+        self._user_store = user_store
         self._sock: Optional[socket.socket] = None
         self._running = False
         
@@ -189,7 +220,7 @@ class TCPServer:
         while self._running:
             try:
                 client_sock, addr = self._sock.accept()
-                handler = ClientHandler(client_sock, addr, self._db)
+                handler = ClientHandler(client_sock, addr, self._db, self._user_store)
                 handler.start()
             except socket.timeout:
                 continue
@@ -220,9 +251,17 @@ class PyDBClient:
         Server port number.
     """
  
-    def __init__(self, host: str = "127.0.0.1", port: int = 5433):
+    def __init__(self, host: str = "127.0.0.1", port: int = 5433,
+                 username: str | None = None, password: str | None = None):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((host, port))
+        if username is not None:
+            auth_msg = json.dumps({"auth": {"username": username, "password": password or ""}})
+            _send_message(self._sock, auth_msg)
+            resp = json.loads(_read_message(self._sock))
+            if not resp.get("ok"):
+                self._sock.close()
+                raise ConnectionError(f"Authentication failed: {resp.get('message', '')}")
  
     def execute(self, sql: str) -> dict:
         """Send a SQL statement and return the JSON result.
