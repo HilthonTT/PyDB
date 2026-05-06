@@ -59,7 +59,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from pydb.catalog import Catalog, TableDef, IndexDef
+from pydb.catalog import Catalog
 from pydb.parser import (
     SelectStmt, InsertStmt, UpdateStmt, DeleteStmt,
     CreateTableStmt, DropTableStmt, CreateIndexStmt,

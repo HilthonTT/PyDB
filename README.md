@@ -162,6 +162,32 @@ def query():
     return jsonify(result)
 ```
 
+### Todo Web API Example
+
+A complete REST API for a todo-list app, using only the Python standard library, lives in [`examples/todo_api.py`](examples/todo_api.py). It demonstrates:
+
+- Schema bootstrap (`CREATE TABLE`) with idempotent startup
+- A connection-pooled data-access layer (`TodoStore`)
+- `BEGIN`/`COMMIT`/`ROLLBACK` around an `INSERT` + `SELECT` to fetch the auto-generated `id`
+- Safe interpolation of user input into SQL via the standard `''` escape
+- A threaded `http.server` exposing `GET`/`POST`/`PUT`/`DELETE /todos`
+
+Run it after starting the PyDB server:
+
+```bash
+# Terminal 1
+python -m pydb.main --data todo_db --server --port 5433
+
+# Terminal 2
+python examples/todo_api.py
+
+# Terminal 3
+curl -X POST http://127.0.0.1:8000/todos \
+     -H 'Content-Type: application/json' \
+     -d '{"title": "Buy milk", "description": "2L whole"}'
+curl http://127.0.0.1:8000/todos
+```
+
 ## SQL Support
 
 ### Data Definition
