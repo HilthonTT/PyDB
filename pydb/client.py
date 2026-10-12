@@ -156,8 +156,18 @@ class Client:
         """
         if self._sock is None:
             raise ConnectionError("Client is closed")
-        _send_message(self._sock, sql)
-        resp = _read_message(self._sock)
+        try:
+            _send_message(self._sock, sql)
+            resp = _read_message(self._sock)
+        except (OSError, ValueError):
+            # The stream is dead or out of sync — mark the client closed
+            # so pools do not hand it out again.
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+            raise
         return json.loads(resp)
 
     @property
@@ -245,12 +255,22 @@ class ConnectionPool:
         for _ in range(min_size):
             self._pool.put(self._new_conn())
 
-    def _new_conn(self) -> Client:
-        """Create a new connection and track pool size."""
-        with self._lock:
-            self._size += 1
-        return Client(self._host, self._port, self._timeout,
-                      self._username, self._password)
+    def _new_conn(self, reserved: bool = False) -> Client:
+        """Create a new connection and track pool size.
+
+        If *reserved* is true the caller already counted this
+        connection in ``_size`` (while holding ``_lock``).
+        """
+        if not reserved:
+            with self._lock:
+                self._size += 1
+        try:
+            return Client(self._host, self._port, self._timeout,
+                          self._username, self._password)
+        except Exception:
+            with self._lock:
+                self._size -= 1
+            raise
 
     def acquire(self) -> Client:
         """Get a connection from the pool (blocking if needed).
@@ -283,8 +303,11 @@ class ConnectionPool:
 
         # Can we create a new one?
         with self._lock:
-            if self._size < self._max_size:
-                return self._new_conn()
+            reserved = self._size < self._max_size
+            if reserved:
+                self._size += 1
+        if reserved:
+            return self._new_conn(reserved=True)
 
         # Pool exhausted — block until one is returned
         conn = self._pool.get(timeout=30)

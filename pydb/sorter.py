@@ -125,21 +125,25 @@ class ExternalMergeSorter:
         
         # Phase 1 - create sorted runs
         buf: list = []
-        for row in rows:
-            buf.append(row)
-            if len(buf) >= self._mem:
+        try:
+            for row in rows:
+                buf.append(row)
+                if len(buf) >= self._mem:
+                    self._flush_run(buf)
+                    buf = []
+
+            if buf:
                 self._flush_run(buf)
-                buf = []
-        
-        if buf:
-            self._flush_run(buf)
+        except Exception:
+            self.cleanup()
+            raise
             
         if not self._run_files:
             return iter([])
         
         # Everything fit in one run — stream it back directly.
         if len(self._run_files) == 1:
-            return self._read_run(self._run_files[0])
+            return self._read_final(self._run_files[0])
         
         # Phase 2 - multi-pass K-way merge
         runs = list(self._run_files)
@@ -157,11 +161,10 @@ class ExternalMergeSorter:
                             p.unlink(missing_ok=True)
                 runs = next_runs
         except Exception:
-            for p in runs:
-                p.unlink(missing_ok=True)
+            self.cleanup()
             raise
 
-        return self._read_run(runs[0])
+        return self._read_final(runs[0])
     
     def cleanup(self):
         """Delete all temporary run files.
@@ -196,6 +199,14 @@ class ExternalMergeSorter:
                 except EOFError:
                     break
         
+    def _read_final(self, path: Path) -> Iterator:
+        """Yield rows from the final run, deleting the file once the
+        iterator is exhausted or closed."""
+        try:
+            yield from self._read_run(path)
+        finally:
+            path.unlink(missing_ok=True)
+
     def _merge_runs(self, paths: list[Path]) -> Path:
         """Merge multiple sorted run files into one using a min-heap.
  
@@ -204,6 +215,7 @@ class ExternalMergeSorter:
         """
         iters = [self._read_run(p) for p in paths]
         out_path = self._make_tmp()
+        self._run_files.append(out_path)
         
         heap: list[tuple] = []
         for idx, it in enumerate(iters):

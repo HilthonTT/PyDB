@@ -67,13 +67,14 @@ by ``COMMIT``/``ROLLBACK``.
 from __future__ import annotations
 
 import fnmatch
+import re
 import threading
 from typing import Any, Iterator, Optional
 
-from pydb import INVALID_PAGE
+from pydb import INVALID_PAGE, MAX_RECORD_SIZE
 from pydb.page import PageType, RID
 from pydb.cache import BufferPool
-from pydb.btree import BPlusTree
+from pydb.btree import BPlusTree, _deserialize_internal
 from pydb.catalog import (
     Catalog, TableDef, TableStats, Column, ColType,
     encode_record, decode_record, encode_key, parse_col_type,
@@ -188,6 +189,8 @@ class Executor:
         """
         # transaction control
         if isinstance(plan, BeginPlan):
+            if getattr(self._local, 'current_txn', None) is not None:
+                raise ExecutionError("A transaction is already in progress")
             txn = self._txn.begin()
             self._local.current_txn = txn
             return {"columns": [], "rows": [], "message": f"BEGIN (txn {txn.txn_id})"}
@@ -235,6 +238,11 @@ class Executor:
                 self._txn.abort(txn)
             raise
         
+    def _lock(self, txn: Transaction, page_id: int, mode: LockMode):
+        """Acquire a lock or raise if it timed out (probable deadlock)."""
+        if not self._txn.acquire(txn, page_id, mode):
+            raise ExecutionError(f"Lock timeout on page {page_id} (possible deadlock)")
+
     def _exec(self, plan, txn: Transaction) -> dict:
         if isinstance(plan, ExplainPlan):
             text = format_plan(plan.child, catalog=self._cat)
@@ -300,7 +308,7 @@ class Executor:
     def _exec_drop_table(self, plan: DropTablePlan, txn: Transaction) -> dict:
         table_name = plan.table
         tdef = self._cat.get_table(table_name)
-        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        self._lock(txn, tdef.heap_page, LockMode.EXCLUSIVE)
 
         # Deallocate all heap pages
         pid = tdef.heap_page
@@ -311,10 +319,17 @@ class Executor:
             self._pool.delete_page(pid)
             pid = next_pid
 
-        # Deallocate index root pages
+        # Deallocate every B+Tree page (internal and leaf) of each index
         for idx in tdef.indexes.values():
-            if idx.root_page != INVALID_PAGE:
-                self._pool.delete_page(idx.root_page)
+            stack = [idx.root_page] if idx.root_page != INVALID_PAGE else []
+            while stack:
+                pid = stack.pop()
+                page = self._pool.fetch_page(pid)
+                if page.page_type == PageType.BTREE_INTERNAL:
+                    _, children = _deserialize_internal(page.read(0))
+                    stack.extend(children)
+                self._pool.unpin(pid)
+                self._pool.delete_page(pid)
 
         self._cat.drop_table(table_name)
         return {"columns": [], "rows": [], "message": f"Table '{table_name}' dropped"}
@@ -330,17 +345,29 @@ class Executor:
         
         # back-fill existing rows
         idx_col_defs = [tdef.columns[tdef.col_index(c)] for c in stmt.columns]
-        for rid, row in self._scan_heap(tdef, txn):
-            key_vals = [row[tdef.col_index(c)] for c in stmt.columns]
-            key = encode_key(idx_col_defs, key_vals)
-            tree.insert(key, rid)
- 
+        try:
+            for rid, row in self._scan_heap(tdef, txn):
+                key_vals = [row[tdef.col_index(c)] for c in stmt.columns]
+                key = encode_key(idx_col_defs, key_vals)
+                if (stmt.unique and None not in key_vals
+                        and any(True for _ in tree.range_scan(key, key))):
+                    raise ExecutionError(
+                        f"Cannot create unique index '{stmt.index_name}': duplicate key "
+                        f"({', '.join(map(repr, key_vals))})")
+                tree.insert(key, rid)
+                idef.root_page = tree.root_pid
+        except Exception:
+            # un-register the half-built index (its pages are undone on abort)
+            self._cat.indexes.pop(stmt.index_name.lower(), None)
+            tdef.indexes.pop(stmt.index_name, None)
+            raise
+
         return {"columns": [], "rows": [],
                 "message": f"Index '{stmt.index_name}' created on {stmt.table}({', '.join(stmt.columns)})"}
         
     def _exec_insert(self, plan: InsertPlan, txn: Transaction) -> dict:
         tdef = self._cat.get_table(plan.table)
-        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        self._lock(txn, tdef.heap_page, LockMode.EXCLUSIVE)
  
         cols = plan.columns if plan.columns else tdef.col_names
         count = 0
@@ -355,10 +382,14 @@ class Executor:
  
             # auto-generate PK if integer pk with no value
             for i, c in enumerate(tdef.columns):
-                if c.primary_key and c.col_type == ColType.INTEGER and values[i] is None:
-                    values[i] = tdef.next_rowid
-                    tdef.next_rowid += 1
- 
+                if c.primary_key and c.col_type == ColType.INTEGER:
+                    if values[i] is None:
+                        values[i] = tdef.next_rowid
+                        tdef.next_rowid += 1
+                    elif int(values[i]) >= tdef.next_rowid:
+                        tdef.next_rowid = int(values[i]) + 1
+
+            self._check_constraints(tdef, values)
             record = encode_record(tdef.columns, values)
             rid = self._heap_insert(tdef, record, txn)
  
@@ -378,7 +409,7 @@ class Executor:
 
     def _exec_update(self, plan: UpdatePlan, txn: Transaction) -> dict:
         tdef = self._cat.get_table(plan.table)
-        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        self._lock(txn, tdef.heap_page, LockMode.EXCLUSIVE)
         count = 0
 
         # Collect (RID, old_row) pairs matching the filter
@@ -396,6 +427,11 @@ class Executor:
                 ci = tdef.col_index(col_name)
                 ctx = {c.name.lower(): row[i] for i, c in enumerate(tdef.columns)}
                 new_vals[ci] = self._eval_expr(expr, ctx, [])
+            self._check_constraints(tdef, new_vals, ignore_rid=rid)
+            for i, c in enumerate(tdef.columns):
+                if (c.primary_key and c.col_type == ColType.INTEGER
+                        and new_vals[i] is not None and int(new_vals[i]) >= tdef.next_rowid):
+                    tdef.next_rowid = int(new_vals[i]) + 1
             new_record = encode_record(tdef.columns, new_vals)
 
             # Delete old record
@@ -426,9 +462,28 @@ class Executor:
  
         return {"columns": [], "rows": [], "message": f"{count} row(s) updated"}
  
+    def _check_constraints(self, tdef: TableDef, values: list, ignore_rid=None):
+        """Enforce NOT NULL and unique-index constraints for a new row."""
+        for i, c in enumerate(tdef.columns):
+            if values[i] is None and not c.nullable:
+                raise ExecutionError(f"NULL value in column '{c.name}' violates NOT NULL")
+        for idx in tdef.indexes.values():
+            if not idx.unique:
+                continue
+            key_vals = [values[tdef.col_index(c)] for c in idx.columns]
+            if any(v is None for v in key_vals):
+                continue  # NULLs never conflict
+            idx_cols = [tdef.columns[tdef.col_index(c)] for c in idx.columns]
+            key = encode_key(idx_cols, key_vals)
+            tree = BPlusTree(self._pool, idx.root_page)
+            for _, rid in tree.range_scan(key, key):
+                if rid != ignore_rid:
+                    raise ExecutionError(
+                        f"Duplicate key ({', '.join(map(repr, key_vals))}) violates unique index '{idx.name}'")
+
     def _exec_delete(self, plan: DeletePlan, txn: Transaction) -> dict:
         tdef = self._cat.get_table(plan.table)
-        self._txn.acquire(txn, tdef.heap_page, LockMode.EXCLUSIVE)
+        self._lock(txn, tdef.heap_page, LockMode.EXCLUSIVE)
         count = 0
  
         rids_to_delete = []
@@ -521,7 +576,7 @@ class Executor:
             
     def _pull_seq_scan(self, node: SeqScan, txn: Transaction):
         tdef = self._cat.get_table(node.table)
-        self._txn.acquire(txn, tdef.heap_page, LockMode.SHARED)
+        self._lock(txn, tdef.heap_page, LockMode.SHARED)
         for rid, row in self._scan_heap(tdef, txn):
             if node.filter:
                 ctx = self._row_context(tdef, row, node.alias)
@@ -532,6 +587,7 @@ class Executor:
     def _pull_index_scan(self, node: IndexScan, txn: Transaction):
         tdef = self._cat.get_table(node.table)
         idef = self._cat.get_index(node.index_name)
+        self._lock(txn, tdef.heap_page, LockMode.SHARED)
         tree = BPlusTree(self._pool, idef.root_page)
  
         if node.lookup_key and isinstance(node.lookup_key, dict):
@@ -572,31 +628,33 @@ class Executor:
  
     def _pull_nlj(self, node: NestedLoopJoin, txn: Transaction):
         left_rows = list(self._pull(node.left, txn))
-        l_tdef = self._scan_tdef(node.left)
-        r_tdef = self._scan_tdef(node.right)
- 
+        right_rows = list(self._pull(node.right, txn))
+        l_width = sum(len(t.columns) for t, _ in self._plan_tables(node.left))
+        r_width = sum(len(t.columns) for t, _ in self._plan_tables(node.right))
+        right_matched = [False] * len(right_rows)
+
         for lrow in left_rows:
             matched = False
-            for rrow in self._pull(node.right, txn):
+            for ri, rrow in enumerate(right_rows):
                 combined = list(lrow) + list(rrow)
                 if node.on:
-                    ctx = {}
-                    if l_tdef:
-                        ctx.update(self._row_context(l_tdef, lrow,
-                                                      getattr(node.left, 'alias', None)))
-                    if r_tdef:
-                        ctx.update(self._row_context(r_tdef, rrow,
-                                                      getattr(node.right, 'alias', None)))
+                    ctx = self._plan_context(node, combined)
                     if not self._eval_expr(node.on, ctx, []):
                         continue
                 matched = True
+                right_matched[ri] = True
                 yield combined
             if not matched and node.join_type == "LEFT":
-                yield list(lrow) + [None] * (len(r_tdef.columns) if r_tdef else 0)
+                yield list(lrow) + [None] * r_width
+        if node.join_type == "RIGHT":
+            for ri, rrow in enumerate(right_rows):
+                if not right_matched[ri]:
+                    yield [None] * l_width + list(rrow)
  
     def _pull_filter(self, node: Filter, txn: Transaction):
         for row in self._pull(node.child, txn):
-            if self._eval_expr(node.predicate, {}, row):
+            ctx = self._plan_context(node.child, row)
+            if self._eval_expr(node.predicate, ctx, row):
                 yield row
  
     def _pull_projection(self, node: Projection, txn: Transaction):
@@ -645,21 +703,20 @@ class Executor:
                     yield out
                 else:
                     out = []
+                    ctx = self._plan_context(node.child, row)
                     for c in node.columns:
-                        ctx = self._row_context(tdef, row) if tdef else {}
                         out.append(self._eval_expr(c, ctx, row))
                     yield out
  
     def _pull_sort(self, node: SortNode, txn: Transaction):
-        tdef = self._scan_tdef(node.child)
         rows = list(self._pull(node.child, txn))
 
         order_specs = node.order_by
 
         def make_key(row):
             parts = []
+            ctx = self._plan_context(node.child, row)
             for expr, direction in order_specs:
-                ctx = self._row_context(tdef, row) if tdef else {}
                 val = self._eval_expr(expr, ctx, row)
                 if val is None:
                     # NULLs sort first in ASC, last in DESC
@@ -681,6 +738,8 @@ class Executor:
     def _pull_limit(self, node: LimitNode, txn: Transaction):
         count = 0
         skipped = 0
+        if node.limit <= 0:
+            return
         for row in self._pull(node.child, txn):
             if skipped < node.offset:
                 skipped += 1
@@ -696,22 +755,22 @@ class Executor:
  
         if not node.group_by:
             # single-group aggregation
-            result = self._compute_aggs(node.aggregates, rows, tdef)
+            result = self._compute_aggs(node.aggregates, rows, node.child)
             yield result
             return
  
         # group by
         groups: dict[tuple, list] = {}
         for row in rows:
-            ctx = self._row_context(tdef, row) if tdef else {}
+            ctx = self._plan_context(node.child, row)
             gkey = tuple(self._eval_expr(g, ctx, row) for g in node.group_by)
             groups.setdefault(gkey, []).append(row)
  
         for gkey, grows in groups.items():
-            agg_vals = self._compute_aggs(node.aggregates, grows, tdef)
+            agg_vals = self._compute_aggs(node.aggregates, grows, node.child)
             result = list(gkey) + agg_vals
             if node.having:
-                ctx = self._row_context(tdef, grows[0]) if tdef else {}
+                ctx = self._plan_context(node.child, grows[0])
                 # Inject computed aggregate values so HAVING can reference them
                 agg_ctx = {}
                 for agg_expr, agg_val in zip(node.aggregates, agg_vals):
@@ -721,32 +780,29 @@ class Executor:
                     continue
             yield result
  
-    def _compute_aggs(self, aggs: list, rows: list, tdef) -> list:
+    def _compute_aggs(self, aggs: list, rows: list, child) -> list:
         result = []
         for agg in aggs:
             if not isinstance(agg, FuncCall):
                 continue
             fname = agg.name.upper()
+            if fname == "COUNT" and agg.args and isinstance(agg.args[0], Literal) \
+                    and agg.args[0].value == "*":
+                result.append(len(rows))
+                continue
+            col_vals = [v for v in self._extract_col_values(agg.args[0], rows, child)
+                        if v is not None]
+            if agg.distinct:
+                col_vals = list(dict.fromkeys(col_vals))
             if fname == "COUNT":
-                if agg.args and isinstance(agg.args[0], Literal) and agg.args[0].value == "*":
-                    result.append(len(rows))
-                else:
-                    col_vals = self._extract_col_values(agg.args[0], rows, tdef)
-                    result.append(sum(1 for v in col_vals if v is not None))
+                result.append(len(col_vals))
             elif fname == "SUM":
-                col_vals = self._extract_col_values(agg.args[0], rows, tdef)
-                result.append(sum(v for v in col_vals if v is not None))
+                result.append(sum(col_vals) if col_vals else None)
             elif fname == "AVG":
-                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
-                            if v is not None]
                 result.append(sum(col_vals) / len(col_vals) if col_vals else None)
             elif fname == "MIN":
-                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
-                            if v is not None]
                 result.append(min(col_vals) if col_vals else None)
             elif fname == "MAX":
-                col_vals = [v for v in self._extract_col_values(agg.args[0], rows, tdef)
-                            if v is not None]
                 result.append(max(col_vals) if col_vals else None)
         return result
  
@@ -768,24 +824,25 @@ class Executor:
             return None
         if isinstance(expr, BinaryOp):
             left = self._eval_having(expr.left, ctx, agg_ctx, row)
-            if expr.op == "AND":
-                return bool(left) and bool(self._eval_having(expr.right, ctx, agg_ctx, row))
-            if expr.op == "OR":
-                return bool(left) or bool(self._eval_having(expr.right, ctx, agg_ctx, row))
+            if expr.op in ("AND", "OR"):
+                right = self._eval_having(expr.right, ctx, agg_ctx, row)
+                return self._eval_logic(expr.op, left, right)
             right = self._eval_having(expr.right, ctx, agg_ctx, row)
             return self._eval_binop(expr.op, left, right)
         if isinstance(expr, UnaryOp):
             val = self._eval_having(expr.operand, ctx, agg_ctx, row)
             if expr.op == "NOT":
-                return not val
+                return None if val is None else not val
+            if expr.op == "-":
+                return -val if val is not None else None
             return val
         # Fall back to regular expression evaluation for non-aggregate parts
         return self._eval_expr(expr, ctx, row)
 
-    def _extract_col_values(self, expr, rows, tdef):
+    def _extract_col_values(self, expr, rows, child):
         vals = []
         for row in rows:
-            ctx = self._row_context(tdef, row) if tdef else {}
+            ctx = self._plan_context(child, row)
             vals.append(self._eval_expr(expr, ctx, row))
         return vals
  
@@ -804,6 +861,8 @@ class Executor:
  
     def _heap_insert(self, tdef: TableDef, record: bytes, txn: Transaction) -> RID:
         """Insert a record into the table's heap, allocating overflow pages as needed."""
+        if len(record) > MAX_RECORD_SIZE:
+            raise ExecutionError(f"Record too large ({len(record)} bytes, max {MAX_RECORD_SIZE})")
         pid = tdef.heap_page
         while True:
             page = self._pool.fetch_page(pid)
@@ -861,19 +920,19 @@ class Executor:
         if isinstance(expr, BinaryOp):
             left = self._eval_expr(expr.left, ctx, row)
             if expr.op == "AND":
-                if not left:
+                if left is not None and not left:
                     return False
-                return bool(self._eval_expr(expr.right, ctx, row))
+                return self._eval_logic("AND", left, self._eval_expr(expr.right, ctx, row))
             if expr.op == "OR":
-                if left:
+                if left is not None and left:
                     return True
-                return bool(self._eval_expr(expr.right, ctx, row))
+                return self._eval_logic("OR", left, self._eval_expr(expr.right, ctx, row))
             right = self._eval_expr(expr.right, ctx, row)
             return self._eval_binop(expr.op, left, right)
         if isinstance(expr, UnaryOp):
             val = self._eval_expr(expr.operand, ctx, row)
             if expr.op == "NOT":
-                return not val
+                return None if val is None else not val
             if expr.op == "-":
                 return -val if val is not None else None
         if isinstance(expr, IsNullExpr):
@@ -883,13 +942,22 @@ class Executor:
         if isinstance(expr, InExpr):
             val = self._eval_expr(expr.expr, ctx, row)
             vals = [self._eval_expr(v, ctx, row) for v in expr.values]
+            if val is None:
+                return None
             result = val in vals
+            if not result and None in vals:
+                return None
             return not result if expr.negated else result
         if isinstance(expr, BetweenExpr):
             val = self._eval_expr(expr.expr, ctx, row)
             lo = self._eval_expr(expr.low, ctx, row)
             hi = self._eval_expr(expr.high, ctx, row)
-            return lo <= val <= hi if val is not None else False
+            if val is None or lo is None or hi is None:
+                return None
+            try:
+                return lo <= val <= hi
+            except TypeError:
+                return None
         if isinstance(expr, FuncCall):
             # aggregates are handled at the aggregate node level
             return None
@@ -897,10 +965,7 @@ class Executor:
  
     def _eval_binop(self, op: str, left, right):
         if left is None or right is None:
-            return None if op not in ("=", "<>") else (
-                (left is None and right is None) if op == "=" else
-                not (left is None and right is None)
-            )
+            return None
         try:
             if op == "=":  return left == right
             if op == "<>": return left != right
@@ -913,13 +978,49 @@ class Executor:
             if op == "*":  return left * right
             if op == "/":  return left / right if right != 0 else None
             if op == "LIKE":
-                pattern = str(right).replace("%", "*").replace("_", "?")
-                return fnmatch.fnmatch(str(left), pattern)
+                pattern = "".join(".*" if ch == "%" else "." if ch == "_" else re.escape(ch)
+                                  for ch in str(right))
+                return re.fullmatch(pattern, str(left), re.DOTALL) is not None
         except TypeError:
             return None
         return None
  
+    def _eval_logic(self, op: str, left, right):
+        """Three-valued AND / OR (``None`` is SQL UNKNOWN)."""
+        if op == "AND":
+            if (left is not None and not left) or (right is not None and not right):
+                return False
+            return None if left is None or right is None else True
+        if (left is not None and left) or (right is not None and right):
+            return True
+        return None if left is None or right is None else False
+
     # helpers
+    def _plan_tables(self, node) -> list:
+        """Return ``[(tdef, alias), ...]`` describing the row layout of *node*."""
+        if isinstance(node, (SeqScan, IndexScan)):
+            try:
+                return [(self._cat.get_table(node.table), node.alias)]
+            except KeyError:
+                return []
+        if isinstance(node, NestedLoopJoin):
+            return self._plan_tables(node.left) + self._plan_tables(node.right)
+        if isinstance(node, (Filter, SortNode, LimitNode)):
+            return self._plan_tables(node.child)
+        return []
+
+    def _plan_context(self, node, row: list) -> dict:
+        """Build an evaluation context for *row* produced by plan *node*
+        (handles joined rows; the leftmost table wins for bare names)."""
+        ctx: dict = {}
+        pos = 0
+        for tdef, alias in self._plan_tables(node):
+            n = len(tdef.columns)
+            for k, v in self._row_context(tdef, row[pos:pos + n], alias).items():
+                ctx.setdefault(k, v)
+            pos += n
+        return ctx
+
     def _row_context(self, tdef: Optional[TableDef], row: list,
                      alias: Optional[str] = None) -> dict:
         if tdef is None:
@@ -949,6 +1050,8 @@ class Executor:
         return None
  
     def _infer_columns(self, node) -> list[str]:
+        if isinstance(node, (LimitNode, SortNode)):
+            return self._infer_columns(node.child)
         if isinstance(node, Projection):
             names = []
             for c in node.columns:
@@ -979,7 +1082,10 @@ class Executor:
                                          for x in a.args)
                     names.append(f"{a.name}({args_str})")
             return names if names else ["?"]
-        # Default: all columns from the base table
+        # Default: all columns from the base table(s)
+        tables = self._plan_tables(node)
+        if tables:
+            return [n for t, _ in tables for n in t.col_names]
         tdef = self._scan_tdef(node)
         if tdef:
             return tdef.col_names

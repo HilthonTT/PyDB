@@ -485,6 +485,8 @@ def encode_key(columns: list[Column], values: list[Any]) -> bytes:
             parts.append(struct.pack(">Q", v))
         elif col.col_type == ColType.FLOAT:
             f = float(val)
+            if f == 0.0:
+                f = 0.0  # -0.0 == 0.0 must encode to the same key
             bits = struct.unpack(">Q", struct.pack(">d", f))[0]
             if f >= 0:
                 bits ^= (1 << 63)

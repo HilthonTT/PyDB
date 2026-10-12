@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="PyDB icon">
+  <title>PyDB</title>
+  <rect width="128" height="128" rx="24" fill="#0f172a"/>
+  <!-- Database cylinder in Python colours, drawn bottom band first -->
+  <g transform="translate(24 -3)">
+    <path d="M0,90 L0,104 A40,12 0 0 0 80,104 L80,90 A40,12 0 0 1 0,90 Z" fill="#306998"/>
+    <path d="M0,60 L0,86 A40,12 0 0 0 80,86 L80,60 A40,12 0 0 1 0,60 Z" fill="#4B8BBE"/>
+    <path d="M0,30 L0,56 A40,12 0 0 0 80,56 L80,30 A40,12 0 0 1 0,30 Z" fill="#FFD43B"/>
+    <ellipse cx="40" cy="30" rx="40" ry="12" fill="#FFE873"/>
+    <!-- B+Tree glyph on the lid -->
+    <g fill="#306998">
+      <circle cx="40" cy="27" r="3"/>
+      <circle cx="26" cy="33" r="2.5"/>
+      <circle cx="54" cy="33" r="2.5"/>
+    </g>
+    <path d="M40,27 L26,33 M40,27 L54,33" stroke="#306998" stroke-width="1.5"/>
+  </g>
+</svg>

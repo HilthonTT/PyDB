@@ -138,13 +138,16 @@ class Transaction:
         manager knows which log records have already been applied.
     """
     
-    __slots__ = ("txn_id", "state", "locks", "modified_pages", "lsn")
-    
+    __slots__ = ("txn_id", "state", "locks", "modified_pages", "freed_pages", "lsn")
+
     def __init__(self, txn_id: int):
         self.txn_id = txn_id
         self.state = TxnState.ACTIVE
         self.locks: dict[int, LockMode] = {}
         self.modified_pages: set[int] = set()
+        # Pages released during the txn; returned to the free list only
+        # at commit so an abort can restore nodes that still reference them.
+        self.freed_pages: list[int] = []
         self.lsn = 0
     
 class LockManager:
@@ -372,6 +375,9 @@ class TransactionManager:
         
         for pid in txn.modified_pages:
             self._pool.flush_page(pid)
+        for pid in txn.freed_pages:
+            self._pool.delete_page(pid)
+        txn.freed_pages.clear()
         self._lock_mgr.release_all(txn.txn_id)
         txn.state = TxnState.COMMITTED
         with self._mu:
@@ -390,6 +396,10 @@ class TransactionManager:
         for rec in self._wal.iter_records():
             if rec.txn_id == txn.txn_id and rec.rec_type == LogRecordType.UPDATE:
                 updates.append(rec)
+        # Pages this txn freed (e.g. B+Tree merges) are restored below;
+        # take them back off the disk free list before they are reused.
+        for pid in {rec.page_id for rec in updates}:
+            self._pool._disk.reclaim_page(pid)
         for rec in reversed(updates):
             before, _ = _parse_update_payload(rec.data)
             page = self._pool.fetch_page(rec.page_id)
@@ -397,6 +407,14 @@ class TransactionManager:
             page._read_header()
             self._pool.unpin(rec.page_id, dirty=True)
 
+        # Force the restored pages before logging ABORT: recovery skips
+        # aborted txns, so a stolen (already flushed) dirty page would
+        # otherwise keep the rolled-back changes after a crash.
+        self._wal.flush()
+        for pid in {rec.page_id for rec in updates}:
+            self._pool.flush_page(pid)
+
+        txn.freed_pages.clear()
         self._wal.append(txn.txn_id, LogRecordType.ABORT)
         self._lock_mgr.release_all(txn.txn_id)
         txn.state = TxnState.ABORTED

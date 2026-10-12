@@ -139,6 +139,7 @@ class REPL:
                 line = input(prompt)
             except (EOFError, KeyboardInterrupt):
                 print("\nGoodbye!")
+                self._shutdown()
                 break
             
             stripped = line.strip()
@@ -231,7 +232,11 @@ Special commands:
                     print(f"  {ix.name} ON {ix.table_name} {uq}({', '.join(ix.columns)})")
  
         elif name == ".server":
-            port = int(parts[1]) if len(parts) > 1 else 5433
+            try:
+                port = int(parts[1]) if len(parts) > 1 else 5433
+            except ValueError:
+                print("Usage: .server [PORT]")
+                return
             if self._server:
                 print("Server already running")
                 return

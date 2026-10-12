@@ -145,6 +145,9 @@ class UserStore:
         with self._lock:
             user = self._users.get(username.lower())
         if user is None:
+            # Burn the same PBKDF2 cost so unknown usernames cannot be
+            # distinguished from wrong passwords by response time.
+            hash_password(password)
             return False
         return verify_password(password, user.password_hash, user.salt)
 

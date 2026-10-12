@@ -645,6 +645,8 @@ class Parser:
         lo = self._addition()
         self._expect(TT.AND)
         hi = self._addition()
+        if negated:
+            return UnaryOp("NOT", BetweenExpr(left, lo, hi))
         return BetweenExpr(left, lo, hi)
 
     def _addition(self):
@@ -808,6 +810,8 @@ class Parser:
             elif self._match(TT.NOT):
                 self._expect(TT.NULL)
                 nullable = False
+            elif self._match(TT.NULL):
+                pass
         return (cname, ctype, nullable, pk)
 
     def _create_index(self, unique: bool):

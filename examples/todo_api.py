@@ -132,7 +132,10 @@ class TodoStore:
         with self._pool.connection() as db:
             db.execute("BEGIN")
             try:
-                db.execute(insert_sql)
+                ins = db.execute(insert_sql)
+                # SQL errors come back as messages, not exceptions.
+                if "inserted" not in ins.get("message", ""):
+                    raise RuntimeError(ins.get("message", "insert failed"))
                 res = db.execute(
                     "SELECT id, title, description, completed FROM todos "
                     "ORDER BY id DESC LIMIT 1"

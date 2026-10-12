@@ -134,6 +134,8 @@ class ClientHandler(threading.Thread):
             creds = req.get("auth", {})
             username = creds.get("username", "")
             password = creds.get("password", "")
+            if not isinstance(username, str) or not isinstance(password, str):
+                raise AttributeError("username and password must be strings")
         except (json.JSONDecodeError, AttributeError):
             _send_message(self._sock, json.dumps(
                 {"ok": False, "message": "Expected auth message"}))
@@ -163,6 +165,9 @@ class ClientHandler(threading.Thread):
                     
                 sql = sql.strip()
                 if not sql:
+                    # Every request gets a reply, or the client blocks forever.
+                    _send_message(self._sock, json.dumps(
+                        {"columns": [], "rows": [], "message": ""}))
                     continue
                 if sql.lower() == ".quit":
                     _send_message(self._sock, json.dumps(
@@ -181,6 +186,12 @@ class ClientHandler(threading.Thread):
         except Exception as e:
             print(f"[server] Error with {self._addr}: {e}")
         finally:
+            # Abort any explicit transaction this connection left open so
+            # its locks are released and its changes undone.
+            try:
+                self._db.execute("ROLLBACK")
+            except Exception:
+                pass
             self._sock.close()
             print(f"[server] Client disconnected: {self._addr}")
             

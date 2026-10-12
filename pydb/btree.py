@@ -86,7 +86,7 @@ from __future__ import annotations
 import struct
 from typing import Optional
 
-from pydb import INVALID_PAGE, BTREE_ORDER, PAGE_SIZE, HEADER_SIZE
+from pydb import INVALID_PAGE, BTREE_ORDER, PAGE_SIZE, HEADER_SIZE, MAX_RECORD_SIZE
 from pydb.page import SlottedPage, PageType, RID
 from pydb.cache import BufferPool
 from pydb.txn import Transaction, TransactionManager
@@ -209,6 +209,22 @@ def _deserialize_leaf(data: bytes) -> tuple[list[bytes], list[RID], int]:
         rids.append(r)
     return keys, rids, next_leaf
  
+def _split_point(keys: list[bytes], overhead: int) -> int:
+    """Index splitting *keys* into two halves of roughly equal byte size.
+
+    Nodes are split by key count, but variable-length (TEXT) keys can
+    overflow the page well before ``ORDER`` keys; in that case the
+    split must balance bytes so both halves fit in a page.
+    """
+    total = sum(len(k) + overhead for k in keys)
+    acc = 0
+    for i, k in enumerate(keys):
+        acc += len(k) + overhead
+        if acc * 2 >= total:
+            return i
+    return len(keys) // 2
+
+
 class BPlusTree:
     """Disk-resident B+Tree stored across ``SlottedPage`` objects.
 
@@ -250,6 +266,13 @@ class BPlusTree:
             page.lsn = lsn
             page._write_header()
 
+    def _free_page(self, page_id: int):
+        """Release a node page; inside a txn the free is deferred to commit."""
+        if self._txn:
+            self._txn.freed_pages.append(page_id)
+        else:
+            self._pool.delete_page(page_id)
+
     def _alloc_node(self, ptype: PageType) -> SlottedPage:
         """Allocate a fresh page from the buffer pool and set its type."""
         p = self._pool.new_page()
@@ -271,6 +294,8 @@ class BPlusTree:
         new blob.  This is safe because B+Tree nodes always occupy
         exactly one slot per page.
         """
+        if len(data) > MAX_RECORD_SIZE:
+            raise ValueError(f"B+Tree node of {len(data)} bytes exceeds page capacity")
         before = page.to_bytes()
         page.num_slots = 0
         page.free_offset = HEADER_SIZE
@@ -282,6 +307,10 @@ class BPlusTree:
     def _read_node(self, page: SlottedPage) -> bytes:
         """Read the serialised node blob from slot 0 of *page*."""
         return page.read(0)
+
+    def _fits(self, *blobs: bytes) -> bool:
+        """``True`` if every serialised node blob fits in a page."""
+        return all(len(b) <= MAX_RECORD_SIZE for b in blobs)
       
     def create(self) -> int:
         """Create an empty B+Tree (a single empty leaf page).
@@ -316,13 +345,19 @@ class BPlusTree:
         """
         if self.root_pid == INVALID_PAGE:
             return None
-        pid = self._find_leaf(key)
-        page = self._load(pid)
-        keys, rids, _ = _deserialize_leaf(self._read_node(page))
-        self._release(pid)
-        for i, k in enumerate(keys):
-            if k == key:
-                return rids[i]
+        # Duplicates of *key* may span several leaves, starting in the
+        # leftmost leaf that can contain it — walk the chain from there.
+        pid = self._find_leaf(key, leftmost=True)
+        while pid != INVALID_PAGE:
+            page = self._load(pid)
+            keys, rids, next_leaf = _deserialize_leaf(self._read_node(page))
+            self._release(pid)
+            for i, k in enumerate(keys):
+                if k == key:
+                    return rids[i]
+                if k > key:
+                    return None
+            pid = next_leaf
         return None
 
     def range_scan(self, lo: Optional[bytes] = None, hi: Optional[bytes] = None):
@@ -346,7 +381,7 @@ class BPlusTree:
         """
         if self.root_pid == INVALID_PAGE:
             return
-        pid = self._find_leaf(lo if lo else b"")
+        pid = self._find_leaf(lo if lo else b"", leftmost=True)
         while pid != INVALID_PAGE:
             page = self._load(pid)
             keys, rids, next_leaf = _deserialize_leaf(self._read_node(page))
@@ -359,11 +394,13 @@ class BPlusTree:
                 yield k, r
             pid = next_leaf
 
-    def _find_leaf(self, key: bytes) -> int:
+    def _find_leaf(self, key: bytes, leftmost: bool = False) -> int:
         """Descend from the root to the leaf that should contain *key*.
 
         At each internal node, finds the child whose key range
         includes *key* by scanning the separator keys left to right.
+        With *leftmost*, descends to the leftmost leaf that may hold
+        *key* (duplicates equal to a separator can live left of it).
 
         Returns
         -------
@@ -380,7 +417,7 @@ class BPlusTree:
             self._release(pid)
             idx = 0
             for i, k in enumerate(keys):
-                if key >= k:
+                if key > k or (key == k and not leftmost):
                     idx = i + 1
                 else:
                     break
@@ -439,13 +476,16 @@ class BPlusTree:
             keys.insert(pos, key)
             rids.insert(pos, rid)
 
-            if len(keys) <= ORDER:
-                self._write_node(page, _serialize_leaf(keys, rids, next_leaf))
+            data = _serialize_leaf(keys, rids, next_leaf)
+            if len(keys) <= ORDER and len(data) <= MAX_RECORD_SIZE:
+                self._write_node(page, data)
                 self._release(pid, dirty=True)
                 return None
 
-            # Split at midpoint.
+            # Split at midpoint (by bytes if the node overflows the page).
             mid = len(keys) // 2
+            if len(data) > MAX_RECORD_SIZE:
+                mid = max(1, min(_split_point(keys, 8) + 1, len(keys) - 1))
             right_page = self._alloc_node(PageType.BTREE_LEAF)
             r_keys, r_rids = keys[mid:], rids[mid:]
             l_keys, l_rids = keys[:mid], rids[:mid]
@@ -479,13 +519,16 @@ class BPlusTree:
         keys.insert(idx, median)
         children.insert(idx + 1, new_child)
 
-        if len(keys) <= ORDER:
-            self._write_node(page, _serialize_internal(children, keys))
+        data = _serialize_internal(children, keys)
+        if len(keys) <= ORDER and len(data) <= MAX_RECORD_SIZE:
+            self._write_node(page, data)
             self._release(pid, dirty=True)
             return None
 
         # Internal node split.
         mid = len(keys) // 2
+        if len(data) > MAX_RECORD_SIZE:
+            mid = max(1, min(_split_point(keys, 6), len(keys) - 2))
         up_key = keys[mid]
         r_keys = keys[mid + 1:]
         r_children = children[mid + 1:]
@@ -535,7 +578,7 @@ class BPlusTree:
                     old_root = self.root_pid
                     self.root_pid = children[0]
                     self._release(old_root)
-                    self._pool.delete_page(old_root)
+                    self._free_page(old_root)
                     return True
             self._release(self.root_pid)
         return deleted
@@ -570,14 +613,14 @@ class BPlusTree:
         keys, children = _deserialize_internal(self._read_node(page))
         self._release(pid)
 
-        idx = 0
-        for i, k in enumerate(keys):
-            if key >= k:
-                idx = i + 1
-            else:
+        # Duplicates of *key* may live in any child between the
+        # leftmost one that can hold it and the rightmost one.
+        lo_idx = sum(1 for k in keys if k < key)
+        hi_idx = sum(1 for k in keys if k <= key)
+        for idx in range(lo_idx, hi_idx + 1):
+            deleted, underflow = self._delete_rec(children[idx], key, rid)
+            if deleted:
                 break
-
-        deleted, underflow = self._delete_rec(children[idx], key, rid)
         if not deleted:
             return False, False
         if not underflow:
@@ -629,9 +672,13 @@ class BPlusTree:
                     ck.insert(0, lk.pop())
                     cr.insert(0, lr.pop())
                     keys[child_idx - 1] = ck[0]
+                    c_data = _serialize_leaf(ck, cr, cn)
+                    p_data = _serialize_internal(children, keys)
+                    if not self._fits(c_data, p_data):
+                        return self._skip_rebalance(left, child, parent)
                     self._write_node(left, _serialize_leaf(lk, lr, ln))
-                    self._write_node(child, _serialize_leaf(ck, cr, cn))
-                    self._write_node(parent, _serialize_internal(children, keys))
+                    self._write_node(child, c_data)
+                    self._write_node(parent, p_data)
                     self._release(left.page_id, True)
                     self._release(child.page_id, True)
                     self._release(parent_pid, True)
@@ -639,10 +686,13 @@ class BPlusTree:
                 # Merge child into left sibling.
                 lk.extend(ck)
                 lr.extend(cr)
-                self._write_node(left, _serialize_leaf(lk, lr, cn))
+                l_data = _serialize_leaf(lk, lr, cn)
+                if not self._fits(l_data):
+                    return self._skip_rebalance(left, child, parent)
+                self._write_node(left, l_data)
                 self._release(left.page_id, True)
                 self._release(child.page_id)
-                self._pool.delete_page(children[child_idx])
+                self._free_page(children[child_idx])
                 keys.pop(child_idx - 1)
                 children.pop(child_idx)
                 self._write_node(parent, _serialize_internal(children, keys))
@@ -656,9 +706,13 @@ class BPlusTree:
                     ck.insert(0, sep)
                     cc.insert(0, lc.pop())
                     keys[child_idx - 1] = lk.pop()
+                    c_data = _serialize_internal(cc, ck)
+                    p_data = _serialize_internal(children, keys)
+                    if not self._fits(c_data, p_data):
+                        return self._skip_rebalance(left, child, parent)
                     self._write_node(left, _serialize_internal(lc, lk))
-                    self._write_node(child, _serialize_internal(cc, ck))
-                    self._write_node(parent, _serialize_internal(children, keys))
+                    self._write_node(child, c_data)
+                    self._write_node(parent, p_data)
                     self._release(left.page_id, True)
                     self._release(child.page_id, True)
                     self._release(parent_pid, True)
@@ -667,10 +721,13 @@ class BPlusTree:
                 lk.append(sep)
                 lk.extend(ck)
                 lc.extend(cc)
-                self._write_node(left, _serialize_internal(lc, lk))
+                l_data = _serialize_internal(lc, lk)
+                if not self._fits(l_data):
+                    return self._skip_rebalance(left, child, parent)
+                self._write_node(left, l_data)
                 self._release(left.page_id, True)
                 self._release(child.page_id)
-                self._pool.delete_page(children[child_idx])
+                self._free_page(children[child_idx])
                 keys.pop(child_idx - 1)
                 children.pop(child_idx)
                 self._write_node(parent, _serialize_internal(children, keys))
@@ -687,19 +744,26 @@ class BPlusTree:
                     ck.append(rk.pop(0))
                     cr.append(rr.pop(0))
                     keys[child_idx] = rk[0]
-                    self._write_node(child, _serialize_leaf(ck, cr, right.page_id))
+                    c_data = _serialize_leaf(ck, cr, right.page_id)
+                    p_data = _serialize_internal(children, keys)
+                    if not self._fits(c_data, p_data):
+                        return self._skip_rebalance(right, child, parent)
+                    self._write_node(child, c_data)
                     self._write_node(right, _serialize_leaf(rk, rr, rn))
-                    self._write_node(parent, _serialize_internal(children, keys))
+                    self._write_node(parent, p_data)
                     self._release(right.page_id, True)
                     self._release(child.page_id, True)
                     self._release(parent_pid, True)
                     return False
                 ck.extend(rk)
                 cr.extend(rr)
-                self._write_node(child, _serialize_leaf(ck, cr, rn))
+                c_data = _serialize_leaf(ck, cr, rn)
+                if not self._fits(c_data):
+                    return self._skip_rebalance(right, child, parent)
+                self._write_node(child, c_data)
                 self._release(child.page_id, True)
                 self._release(right.page_id)
-                self._pool.delete_page(children[child_idx + 1])
+                self._free_page(children[child_idx + 1])
                 keys.pop(child_idx)
                 children.pop(child_idx + 1)
                 self._write_node(parent, _serialize_internal(children, keys))
@@ -713,9 +777,13 @@ class BPlusTree:
                     ck.append(sep)
                     cc.append(rc.pop(0))
                     keys[child_idx] = rk.pop(0)
-                    self._write_node(child, _serialize_internal(cc, ck))
+                    c_data = _serialize_internal(cc, ck)
+                    p_data = _serialize_internal(children, keys)
+                    if not self._fits(c_data, p_data):
+                        return self._skip_rebalance(right, child, parent)
+                    self._write_node(child, c_data)
                     self._write_node(right, _serialize_internal(rc, rk))
-                    self._write_node(parent, _serialize_internal(children, keys))
+                    self._write_node(parent, p_data)
                     self._release(right.page_id, True)
                     self._release(child.page_id, True)
                     self._release(parent_pid, True)
@@ -724,10 +792,13 @@ class BPlusTree:
                 ck.append(sep)
                 ck.extend(rk)
                 cc.extend(rc)
-                self._write_node(child, _serialize_internal(cc, ck))
+                c_data = _serialize_internal(cc, ck)
+                if not self._fits(c_data):
+                    return self._skip_rebalance(right, child, parent)
+                self._write_node(child, c_data)
                 self._release(child.page_id, True)
                 self._release(right.page_id)
-                self._pool.delete_page(children[child_idx + 1])
+                self._free_page(children[child_idx + 1])
                 keys.pop(child_idx)
                 children.pop(child_idx + 1)
                 self._write_node(parent, _serialize_internal(children, keys))
@@ -736,5 +807,15 @@ class BPlusTree:
 
         self._release(child.page_id)
         self._release(parent_pid)
+        return False
+
+    def _skip_rebalance(self, *pages: SlottedPage) -> bool:
+        """Abandon a rebalance whose result would not fit in a page.
+
+        Nothing has been written yet, so the (underfull but valid)
+        nodes are simply left as they are.
+        """
+        for p in pages:
+            self._release(p.page_id)
         return False
       

@@ -201,6 +201,10 @@ class Database:
             if rec.rec_type == LogRecordType.UPDATE:
                 if rec.txn_id not in committed and rec.txn_id not in aborted:
                     uncommitted_updates.append(rec)
+        # Pages freed by an uncommitted txn (e.g. B+Tree merges) are back
+        # in use once restored, so pull them off the free list first.
+        for page_id in {rec.page_id for rec in uncommitted_updates}:
+            self._disk.reclaim_page(page_id)
         for rec in reversed(uncommitted_updates):
             before, _ = _parse_update_payload(rec.data)
             self._disk.write_page(rec.page_id, before)
@@ -220,6 +224,11 @@ class Database:
         3. Truncate the WAL (all pages are durable).
         4. Close the WAL and data file handles.
         """
+        # Roll back transactions still open (e.g. BEGIN without COMMIT)
+        # so their uncommitted pages are not flushed and made durable
+        # by the WAL truncation below.
+        for txn in list(self._txn._active.values()):
+            self._txn.abort(txn)
         self._pool.flush_all()
         cat_path = self._dir / "catalog.json"
         cat_path.write_text(self._catalog.to_json())

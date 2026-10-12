@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 140" width="540" height="140" role="img" aria-label="PyDB logo">
+  <title>PyDB</title>
+  <rect width="540" height="140" rx="20" fill="#0f172a"/>
+  <!-- Database cylinder in Python colours, drawn bottom band first -->
+  <g transform="translate(10 6)">
+    <path d="M40,90 L40,116 A40,12 0 0 0 120,116 L120,90 A40,12 0 0 1 40,90 Z" fill="#306998"/>
+    <path d="M40,60 L40,86 A40,12 0 0 0 120,86 L120,60 A40,12 0 0 1 40,60 Z" fill="#4B8BBE"/>
+    <path d="M40,30 L40,56 A40,12 0 0 0 120,56 L120,30 A40,12 0 0 1 40,30 Z" fill="#FFD43B"/>
+    <ellipse cx="80" cy="30" rx="40" ry="12" fill="#FFE873"/>
+    <!-- B+Tree glyph on the lid -->
+    <g fill="#306998">
+      <circle cx="80" cy="27" r="3"/>
+      <circle cx="66" cy="33" r="2.5"/>
+      <circle cx="94" cy="33" r="2.5"/>
+    </g>
+    <path d="M80,27 L66,33 M80,27 L94,33" stroke="#306998" stroke-width="1.5"/>
+  </g>
+  <text x="150" y="80" font-family="Segoe UI, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="64" font-weight="700" letter-spacing="-1">
+    <tspan fill="#FFD43B">Py</tspan><tspan fill="#ffffff">DB</tspan>
+  </text>
+  <text x="152" y="110" font-family="Segoe UI, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="16" fill="#94a3b8">a relational database engine in pure Python</text>
+</svg>

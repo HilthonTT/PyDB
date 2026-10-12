@@ -287,14 +287,18 @@ class Planner:
                 return ExplainPlan(plan)
             return plan
         
-        # base scan
-        plan = self._make_scan(stmt.from_table.name, stmt.where,
+        # base scan — WHERE can only be pushed down when there are no
+        # joins (it may reference joined tables' columns)
+        plan = self._make_scan(stmt.from_table.name,
+                               None if stmt.joins else stmt.where,
                                alias=stmt.from_table.alias)
         
         # joins 
         for j in stmt.joins:
             right = self._make_scan(j.table.name, None, alias=j.table.alias)
             plan = NestedLoopJoin(plan, right, j.join_type, j.on)
+        if stmt.joins and stmt.where is not None:
+            plan = Filter(plan, stmt.where)
             
         # aggregation
         aggs = [c for c in stmt.columns if isinstance(c, FuncCall)]
@@ -302,6 +306,10 @@ class Planner:
             plan = AggregateNode(plan, stmt.group_by, aggs, stmt.having)
             # add projection to ensure correct column order
             plan = Projection(plan, stmt.columns)
+            # order by — over the projected output, by select-list position
+            if stmt.order_by:
+                plan = SortNode(plan, [(self._output_position(e, stmt.columns), d)
+                                       for e, d in stmt.order_by])
             # limit / offset
             if stmt.limit is not None:
                 plan = LimitNode(plan, stmt.limit, stmt.offset or 0)
@@ -311,7 +319,7 @@ class Planner:
         
         # order by — BEFORE projection so sort can see all columns
         if stmt.order_by:
-            if not self._order_covered_by_index(stmt):
+            if not self._order_covered_by_index(stmt, plan):
                 plan = SortNode(plan, stmt.order_by)
         
         # projection
@@ -386,9 +394,26 @@ class Planner:
                     result[expr.right.name.lower()] = expr.left.value
         return result
     
-    def _order_covered_by_index(self, stmt: SelectStmt) -> bool:
-        """Check if ORDER BY is naturally satisfied by an index."""
-        if not stmt.order_by or not stmt.from_table:
+    def _output_position(self, expr, columns: list):
+        """Map an ORDER BY expression to a positional reference into the
+        select list (used when sorting already-aggregated rows)."""
+        for i, c in enumerate(columns):
+            if c == expr:
+                return ColumnRef(None, str(i))
+        if isinstance(expr, ColumnRef):
+            for i, c in enumerate(columns):
+                if isinstance(c, ColumnRef) and c.name.lower() == expr.name.lower():
+                    return ColumnRef(None, str(i))
+        return expr
+
+    def _order_covered_by_index(self, stmt: SelectStmt, plan=None) -> bool:
+        """Check if ORDER BY is naturally satisfied by the chosen index scan."""
+        if not stmt.order_by or not stmt.from_table or stmt.joins:
+            return False
+        # only an IndexScan yields rows in key order, and only ascending
+        if not isinstance(plan, IndexScan):
+            return False
+        if any(d != "ASC" for _, d in stmt.order_by):
             return False
         try:
             tdef = self._cat.get_table(stmt.from_table.name)
@@ -400,11 +425,11 @@ class Planner:
                 order_cols.append(expr.name.lower())
             else:
                 return False
-        for idx in tdef.indexes.values():
-            idx_cols = [c.lower() for c in idx.columns]
-            if idx_cols[:len(order_cols)] == order_cols:
-                return True
-        return False
+        idx = tdef.indexes.get(plan.index_name)
+        if idx is None:
+            return False
+        idx_cols = [c.lower() for c in idx.columns]
+        return idx_cols[:len(order_cols)] == order_cols
     
 def format_plan(node, indent: int = 0, catalog: Catalog = None) -> str:
     """Pretty-print a query plan tree as an indented string.

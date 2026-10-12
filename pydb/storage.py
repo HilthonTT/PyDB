@@ -302,7 +302,40 @@ class DiskManager:
             self._fp.write(struct.pack("<I", self.free_head))
             self.free_head = page_id
             self._write_meta()
- 
+
+    def reclaim_page(self, page_id: int) -> bool:
+        """Unlink *page_id* from the free list if it is on it.
+
+        Used when a transaction that freed the page is rolled back and
+        its contents are restored, so the page must not be handed out
+        again by ``allocate_page``.
+
+        Returns
+        -------
+        bool
+            ``True`` if the page was on the free list and was removed.
+        """
+        with self._lock:
+            prev = None
+            cur = self.free_head
+            steps = 0
+            while cur != INVALID_PAGE and steps < self.page_count:
+                self._fp.seek(cur * PAGE_SIZE)
+                raw = self._fp.read(4)
+                nxt = struct.unpack("<I", raw)[0] if len(raw) >= 4 else INVALID_PAGE
+                if cur == page_id:
+                    if prev is None:
+                        self.free_head = nxt
+                        self._write_meta()
+                    else:
+                        self._fp.seek(prev * PAGE_SIZE)
+                        self._fp.write(struct.pack("<I", nxt))
+                    return True
+                prev = cur
+                cur = nxt
+                steps += 1
+            return False
+
     def close(self):
         """Close the underlying file handle.
  

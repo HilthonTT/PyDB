@@ -218,9 +218,13 @@ class LogRecord:
         """
         lsn, txn_id, rtype, page_id, dlen = _REC_HDR.unpack_from(buf, offset)
         pos = offset + _REC_HDR.size
+        if dlen < 0 or pos + dlen > len(buf):
+            raise struct.error("truncated log record")
         data = buf[pos:pos + dlen]
         pos += dlen
         crc_stored = struct.unpack_from("<I", buf, pos)[0]
+        if zlib.crc32(buf[offset:pos]) & 0xFFFFFFFF != crc_stored:
+            raise ValueError("log record checksum mismatch")
         pos += 4
         rec = cls(lsn, txn_id, LogRecordType(rtype), page_id, data)
         rec.checksum = crc_stored
@@ -290,10 +294,14 @@ class WAL:
         while pos < len(data):
             try:
                 rec, pos = LogRecord.deserialize(data, pos)
-                if rec.lsn > self._lsn:
+                if rec.lsn >= self._lsn:
                     self._lsn = rec.lsn + 1
             except Exception:
                 break
+        if pos < len(data):
+            # drop the torn/corrupt tail so new records are not appended after it
+            self._fp.seek(4 + pos)
+            self._fp.truncate()
             
     def append(self, txn_id: int, rec_type: LogRecordType, page_id: int = 0, data: bytes = b"") -> int:
         """Append a new log record and return its LSN.
@@ -380,13 +388,18 @@ class WAL:
         Called after a clean checkpoint: once all dirty pages have
         been flushed to the data file, the old log records are no
         longer needed for recovery.  The file is truncated to just
-        the 4-byte magic header and the LSN counter is reset to 0.
+        the 4-byte magic header followed by a single ``CHECKPOINT``
+        record.  The LSN counter is *not* reset: pages on disk carry
+        LSNs from before the truncate, and the checkpoint record lets
+        ``_recover_lsn`` resume numbering above them after a restart.
         """
         with self._lock:
             self._fp.seek(0)
             self._fp.truncate()
             self._fp.write(WAL_MAGIC)
-            self._lsn = 0
+            rec = LogRecord(self._lsn, 0, LogRecordType.CHECKPOINT, 0)
+            self._lsn += 1
+            self._fp.write(rec.serialize())
  
     def close(self):
         """Close the underlying file handle.
